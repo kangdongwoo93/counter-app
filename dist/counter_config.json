@@ -1,0 +1,17 @@
+[
+    {
+        "name": "카운터_1",
+        "port": "COM1",
+        "auto_connect": false
+    },
+    {
+        "name": "카운터_2",
+        "port": "COM1",
+        "auto_connect": false
+    },
+    {
+        "name": "카운터_5",
+        "port": "COM1",
+        "auto_connect": false
+    }
+]

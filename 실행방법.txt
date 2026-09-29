@@ -1,0 +1,6 @@
+
+pip install PyQt5 pymodbus pyserial
+
+pip install pyinstaller
+
+python -m PyInstaller --noconsole --onefile counter_app.py
