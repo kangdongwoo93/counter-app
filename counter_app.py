@@ -1,17 +1,18 @@
 import sys
 import os
 import json
-import csv
 import inspect
 from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QComboBox,
                              QMessageBox, QFrame, QGridLayout, QScrollArea, QLineEdit,
                              QGraphicsDropShadowEffect, QSizePolicy, QStatusBar)
-from PyQt5.QtCore import QTimer, Qt, QEvent, QObject, QThread, pyqtSignal, pyqtSlot
-from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtCore import QTimer, Qt, QEvent, QObject, QThread, QUrl, pyqtSignal, pyqtSlot
+from PyQt5.QtGui import QFont, QColor, QDesktopServices
 import serial.tools.list_ports
 from pymodbus.client import ModbusSerialClient
+
+from storage import Settings, StorageWriter, SETTINGS_FILE
 
 # 실행 파일(exe)이 있는 폴더. 설정 파일과 CSV 로그를 이 폴더에 저장한다.
 # (부팅 시 자동 실행되면 작업 폴더가 C:\Windows\System32 등으로 달라질 수 있으므로 고정)
@@ -36,7 +37,11 @@ DEVICE_MAP = {
 _UNIT_KW = ("device_id" if "device_id" in inspect.signature(ModbusSerialClient.read_holding_registers).parameters
             else "slave")
 SLAVE_ID = 1
-POLL_INTERVAL_MS = 1000  # 데이터 읽기 주기
+POLL_INTERVAL_MS = 1000  # 데이터 읽기 주기 (settings.ini 의 poll_interval_ms 로 변경)
+
+
+def collecting_text(port):
+    return f"{port} 연결됨 · {POLL_INTERVAL_MS / 1000:g}초 주기로 수집 중"
 
 CARD_MIN_WIDTH = 360
 
@@ -542,7 +547,7 @@ class CounterCard(QFrame):
         self.connecting = False
         if ok:
             self.running = True
-            self.set_state("connected", f"{port} 연결됨 · 1초 주기로 수집 중")
+            self.set_state("connected", collecting_text(port))
             self.parent_app.save_config()
         else:
             self.set_state("error", f"{port} 연결 실패 — 케이블/포트 사용 여부를 확인하세요.")
@@ -554,30 +559,17 @@ class CounterCard(QFrame):
         now = datetime.now()
         self.lbl_count.setText(f"{count_value:,}")
         self.lbl_updated.setText(f"마지막 수신: {now.strftime('%H:%M:%S')}")
-        try:
-            self.save_to_csv(count_value)
-        except OSError as e:
-            self.parent_app.show_message(f"CSV 저장 실패: {e}")
+        # 저장(CSV / DB)은 저장 스레드에서 처리
+        self.parent_app.storage.put(self.txt_name.text().strip(), self.port, count_value, now)
         if self.state != "connected":
             self.set_state("connected")
-        self.lbl_status.setText(f"{self.port} 연결됨 · 1초 주기로 수집 중")
+        self.lbl_status.setText(collecting_text(self.port))
 
     @pyqtSlot(str)
     def on_read_failed(self, message):
         if not self.running:
             return
         self.set_state("warning", message)
-
-    def save_to_csv(self, count):
-        device_name = self.txt_name.text().strip().replace(" ", "_")
-        filename = f"counter_log_{device_name}_{datetime.now().strftime('%Y%m%d')}.csv"
-
-        file_exists = os.path.exists(filename)
-        with open(filename, mode='a', newline='', encoding='utf-8-sig') as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow(["일시", "장비명", "COM포트", "카운트 수"])
-            writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), self.txt_name.text(), self.port, count])
 
     def reset_counter(self):
         if not self.running:
@@ -613,13 +605,23 @@ class CounterCard(QFrame):
 
 
 class MainWindow(QMainWindow):
+    # 저장 스레드 → 화면 상태 표시 (텍스트, 수준: ok / warn / error)
+    storage_status = pyqtSignal(str, str)
+
     def __init__(self):
         super().__init__()
+        global POLL_INTERVAL_MS
+        self.settings = Settings()
+        POLL_INTERVAL_MS = self.settings.poll_interval_ms
+        self.storage = StorageWriter(self.settings, on_status=self.storage_status.emit)
+
         self.cards = []
         self.next_card_id = 1
         self.loading = True  # 설정 불러오는 중에는 중간 저장 금지
         self.columns = 2
         self.initUI()
+        self.storage_status.connect(self.on_storage_status)
+        self.storage.start()
         self.load_config_and_autoconnect()
 
         # 상단 시계 갱신
@@ -660,6 +662,12 @@ class MainWindow(QMainWindow):
         btn_refresh_all.setToolTip("연결되지 않은 모든 카드의 COM 포트 목록을 다시 검색합니다.")
         btn_refresh_all.clicked.connect(self.refresh_all_ports)
 
+        btn_settings = QPushButton("⚙  환경설정")
+        btn_settings.setCursor(Qt.PointingHandCursor)
+        btn_settings.setToolTip(f"{SETTINGS_FILE} 파일을 엽니다. (저장 방식 CSV/DB, DB 접속 정보 등)\n"
+                                "수정 후 프로그램을 다시 시작해야 적용됩니다.")
+        btn_settings.clicked.connect(self.open_settings)
+
         btn_add = QPushButton("+  카운터 추가")
         btn_add.setObjectName("Primary")
         btn_add.setCursor(Qt.PointingHandCursor)
@@ -667,6 +675,7 @@ class MainWindow(QMainWindow):
 
         top_bar.addLayout(title_box)
         top_bar.addStretch()
+        top_bar.addWidget(btn_settings)
         top_bar.addWidget(btn_refresh_all)
         top_bar.addWidget(btn_add)
 
@@ -695,7 +704,30 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.scroll)
 
         self.setStatusBar(QStatusBar())
-        self.statusBar().showMessage(f"로그 저장 위치: {os.path.abspath('.')}")
+        self.lbl_storage = QLabel()
+        self.lbl_storage.setObjectName("StorageStatus")
+        self.statusBar().addWidget(self.lbl_storage, 1)
+        self.lbl_station = QLabel(f"PC: {self.settings.station}")
+        self.lbl_station.setObjectName("StatusText")
+        self.statusBar().addPermanentWidget(self.lbl_station)
+        if self.settings.errors:
+            self.on_storage_status("설정 오류: " + " / ".join(self.settings.errors), "error")
+
+    @pyqtSlot(str, str)
+    def on_storage_status(self, text, level):
+        color = {"ok": COLORS["muted"], "warn": COLORS["warn"], "error": COLORS["danger"]}[level]
+        if self.settings.errors and not text.startswith("설정 오류"):
+            text = "설정 오류: " + " / ".join(self.settings.errors) + "   |   " + text
+            color = COLORS["danger"]
+        self.lbl_storage.setStyleSheet(f"color: {color}; padding: 0 4px;")
+        self.lbl_storage.setText(text)
+        self.lbl_storage.setToolTip(text)
+
+    def open_settings(self):
+        path = os.path.abspath(SETTINGS_FILE)
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+            QMessageBox.information(self, "환경설정", f"설정 파일 위치:\n{path}")
+        self.show_message("환경설정을 수정한 뒤 프로그램을 다시 시작해야 적용됩니다.", 10000)
 
     def update_clock(self):
         self.lbl_clock.setText(datetime.now().strftime("%Y-%m-%d (%a) %H:%M:%S"))
@@ -810,6 +842,8 @@ class MainWindow(QMainWindow):
         # 삭제된 카드의 정리 중인 스레드까지 포함해 모든 통신 스레드 종료 대기
         for thread in self.findChildren(QThread):
             thread.wait(8000)
+        # 남은 수집 데이터 저장 후 저장 스레드 종료
+        self.storage.stop()
         event.accept()
 
 if __name__ == "__main__":
