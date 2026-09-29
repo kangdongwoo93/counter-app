@@ -2,12 +2,14 @@ import sys
 import os
 import json
 import csv
+import inspect
 from datetime import datetime
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QLabel, QPushButton, QComboBox, 
-                             QMessageBox, QGroupBox, QGridLayout, QScrollArea, QLineEdit)
-from PyQt5.QtCore import QTimer, Qt
-from PyQt5.QtGui import QFont
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QHBoxLayout, QLabel, QPushButton, QComboBox,
+                             QMessageBox, QFrame, QGridLayout, QScrollArea, QLineEdit,
+                             QGraphicsDropShadowEffect, QSizePolicy, QStatusBar)
+from PyQt5.QtCore import QTimer, Qt, QEvent, QObject, QThread, pyqtSignal, pyqtSlot
+from PyQt5.QtGui import QFont, QColor
 import serial.tools.list_ports
 from pymodbus.client import ModbusSerialClient
 
@@ -23,121 +25,182 @@ DEVICE_MAP = {
     "FT9X123C": "3번 라인 카운터"
 }
 
-class CounterCard(QGroupBox):
-    """개별 카운터 장비를 표시하고 제어하는 카드 위젯"""
-    def __init__(self, card_id, parent_app, default_name="", default_port=""):
-        super().__init__(f"카운터 장비 #{card_id}")
-        self.card_id = card_id
-        self.parent_app = parent_app
-        
+# pymodbus 3.10 이상은 'slave' 대신 'device_id' 인자를 사용
+_UNIT_KW = ("device_id" if "device_id" in inspect.signature(ModbusSerialClient.read_holding_registers).parameters
+            else "slave")
+SLAVE_ID = 1
+POLL_INTERVAL_MS = 1000  # 데이터 읽기 주기
+
+CARD_MIN_WIDTH = 360
+
+# ==============================================================================
+# 2. 화면 스타일 (색상 / 폰트)
+# ==============================================================================
+COLORS = {
+    "bg": "#F1F4F8",
+    "card": "#FFFFFF",
+    "border": "#E3E8EF",
+    "text": "#1F2937",
+    "muted": "#6B7280",
+    "primary": "#2563EB",
+    "primary_hover": "#1D4ED8",
+    "success": "#16A34A",
+    "success_bg": "#DCFCE7",
+    "danger": "#DC2626",
+    "danger_hover": "#B91C1C",
+    "danger_bg": "#FEE2E2",
+    "idle_bg": "#F3F4F6",
+    "warn": "#D97706",
+    "warn_bg": "#FEF3C7",
+}
+
+# 상태별 (배지 텍스트, 글자색, 배경색, 카운트 숫자색)
+STATUS_STYLES = {
+    "idle":      ("● 대기",   COLORS["muted"],   COLORS["idle_bg"],    "#9CA3AF"),
+    "connecting": ("● 연결 중", COLORS["primary"], "#DBEAFE",           "#9CA3AF"),
+    "connected": ("● 수집 중", COLORS["success"], COLORS["success_bg"], COLORS["primary"]),
+    "warning":   ("● 응답 오류", COLORS["warn"],  COLORS["warn_bg"],    COLORS["warn"]),
+    "error":     ("● 연결 실패", COLORS["danger"], COLORS["danger_bg"], "#9CA3AF"),
+}
+
+APP_STYLE = f"""
+QMainWindow, QWidget#Central, QWidget#ScrollContent {{
+    background-color: {COLORS['bg']};
+}}
+QWidget {{
+    color: {COLORS['text']};
+    font-size: 13px;
+}}
+QScrollArea {{ border: none; background: transparent; }}
+
+QFrame#Card {{
+    background-color: {COLORS['card']};
+    border: 1px solid {COLORS['border']};
+    border-radius: 12px;
+}}
+QLabel#CardId {{ color: {COLORS['muted']}; font-size: 11px; font-weight: bold; }}
+QLabel#FieldLabel {{ color: {COLORS['muted']}; font-size: 12px; }}
+QLabel#Count {{
+    font-family: "Consolas", "D2Coding", "Courier New", monospace;
+    font-size: 46px;
+    font-weight: bold;
+    border-radius: 10px;
+    padding: 14px 8px;
+    background-color: #F8FAFC;
+    border: 1px solid {COLORS['border']};
+}}
+QLabel#CountUnit {{ color: {COLORS['muted']}; font-size: 11px; }}
+QLabel#StatusText {{ color: {COLORS['muted']}; font-size: 11px; }}
+QLabel#Title {{ font-size: 20px; font-weight: bold; }}
+QLabel#Subtitle {{ color: {COLORS['muted']}; font-size: 12px; }}
+QLabel#Summary {{
+    background-color: {COLORS['card']};
+    border: 1px solid {COLORS['border']};
+    border-radius: 8px;
+    padding: 6px 12px;
+    color: {COLORS['text']};
+}}
+
+QLineEdit, QComboBox {{
+    background-color: #FFFFFF;
+    border: 1px solid #D1D5DB;
+    border-radius: 6px;
+    padding: 5px 8px;
+    min-height: 20px;
+}}
+QLineEdit:focus, QComboBox:focus {{ border: 1px solid {COLORS['primary']}; }}
+QLineEdit:disabled, QComboBox:disabled {{ background-color: #F3F4F6; color: {COLORS['muted']}; }}
+QLineEdit#NameEdit {{
+    font-size: 15px;
+    font-weight: bold;
+    border: 1px solid transparent;
+    background: transparent;
+    padding: 4px 4px;
+}}
+QLineEdit#NameEdit:hover {{ border: 1px solid #D1D5DB; background: #FFFFFF; }}
+QLineEdit#NameEdit:focus {{ border: 1px solid {COLORS['primary']}; background: #FFFFFF; }}
+QLineEdit#NameEdit:disabled {{ background: transparent; color: {COLORS['text']}; }}
+QComboBox::drop-down {{ border: none; width: 22px; }}
+
+QPushButton {{
+    background-color: #FFFFFF;
+    border: 1px solid #D1D5DB;
+    border-radius: 6px;
+    padding: 7px 14px;
+    font-weight: bold;
+}}
+QPushButton:hover {{ background-color: #F9FAFB; border-color: #9CA3AF; }}
+QPushButton:pressed {{ background-color: #E5E7EB; }}
+QPushButton:disabled {{ color: #9CA3AF; background-color: #F3F4F6; border-color: #E5E7EB; }}
+
+QPushButton#Primary {{
+    background-color: {COLORS['primary']}; color: white; border: none;
+}}
+QPushButton#Primary:hover {{ background-color: {COLORS['primary_hover']}; }}
+
+QPushButton#Connect {{
+    background-color: {COLORS['primary']}; color: white; border: none;
+}}
+QPushButton#Connect:hover {{ background-color: {COLORS['primary_hover']}; }}
+QPushButton#Connect[connected="true"] {{
+    background-color: #FFFFFF; color: {COLORS['text']}; border: 1px solid #D1D5DB;
+}}
+QPushButton#Connect[connected="true"]:hover {{ background-color: #F9FAFB; }}
+
+QPushButton#Danger {{
+    background-color: #FFFFFF; color: {COLORS['danger']}; border: 1px solid #FCA5A5;
+}}
+QPushButton#Danger:hover {{ background-color: {COLORS['danger_bg']}; }}
+QPushButton#Danger:disabled {{ color: #D1A1A1; border-color: #F3D4D4; background-color: #FFFFFF; }}
+
+QPushButton#Icon {{
+    padding: 4px; min-width: 26px; max-width: 26px; min-height: 26px; max-height: 26px;
+    border: 1px solid transparent; background: transparent; color: {COLORS['muted']};
+    font-size: 14px;
+}}
+QPushButton#Icon:hover {{ background-color: {COLORS['idle_bg']}; color: {COLORS['text']}; }}
+QPushButton#IconDanger {{
+    padding: 4px; min-width: 26px; max-width: 26px; min-height: 26px; max-height: 26px;
+    border: 1px solid transparent; background: transparent; color: {COLORS['muted']};
+    font-size: 14px;
+}}
+QPushButton#IconDanger:hover {{ background-color: {COLORS['danger_bg']}; color: {COLORS['danger']}; }}
+
+QStatusBar {{ background-color: {COLORS['card']}; border-top: 1px solid {COLORS['border']}; color: {COLORS['muted']}; }}
+QToolTip {{ background-color: {COLORS['text']}; color: white; border: none; padding: 4px 6px; }}
+"""
+
+
+def repolish(widget):
+    """동적 속성 변경 후 스타일 재적용"""
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
+
+
+class ModbusWorker(QObject):
+    """별도 스레드에서 Modbus 통신(연결/주기 읽기/리셋)을 담당.
+    UI 스레드와는 시그널로만 주고받으므로 통신 지연이 화면을 멈추지 않는다."""
+    connect_result = pyqtSignal(bool, str)   # 성공 여부, 포트
+    count_read = pyqtSignal(int)
+    read_failed = pyqtSignal(str)
+    reset_result = pyqtSignal(bool)
+
+    def __init__(self):
+        super().__init__()
         self.client = None
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_counter)
-        
-        self.initUI(default_name, default_port)
+        self.timer = None
 
-    def initUI(self, default_name, default_port):
-        layout = QVBoxLayout()
-        
-        # 1. 장비 이름 및 포트 설정
-        top_layout = QHBoxLayout()
-        self.txt_name = QLineEdit(default_name if default_name else f"카운터_{self.card_id}")
-        self.txt_name.setPlaceholderText("장비 이름")
-        
-        self.port_combo = QComboBox()
-        self.refresh_ports()
-        
-        # 이전 저장 포트 선택
-        if default_port:
-            index = self.port_combo.findData(default_port)
-            if index >= 0:
-                self.port_combo.setCurrentIndex(index)
+    @pyqtSlot(str)
+    def open_port(self, port):
+        # 타이머는 워커 스레드 안에서 생성해야 해당 스레드에서 동작함
+        if self.timer is None:
+            self.timer = QTimer(self)
+            self.timer.timeout.connect(self.poll)
+        self.timer.stop()
+        self.close_client()
 
-        top_layout.addWidget(QLabel("이름:"))
-        top_layout.addWidget(self.txt_name)
-        top_layout.addWidget(QLabel("포트:"))
-        top_layout.addWidget(self.port_combo)
-        
-        # 2. 실시간 카운트 수 표시
-        self.lbl_count = QLabel("0")
-        self.lbl_count.setAlignment(Qt.AlignCenter)
-        self.lbl_count.setFont(QFont("Arial", 36, QFont.Bold))
-        self.lbl_count.setStyleSheet("color: #007ACC; background-color: #F8F9FA; border: 1px solid #DEE2E6; border-radius: 8px; padding: 10px;")
-        
-        # 3. 제어 버튼들
-        btn_layout = QHBoxLayout()
-        self.btn_connect = QPushButton("연결 시작")
-        self.btn_connect.clicked.connect(self.toggle_connection)
-        
-        self.btn_reset = QPushButton("0 리셋")
-        self.btn_reset.setStyleSheet("background-color: #E74C3C; color: white; font-weight: bold;")
-        self.btn_reset.clicked.connect(self.reset_counter)
-        
-        self.btn_delete = QPushButton("삭제")
-        self.btn_delete.clicked.connect(lambda: self.parent_app.remove_counter_card(self))
-        
-        btn_layout.addWidget(self.btn_connect)
-        btn_layout.addWidget(self.btn_reset)
-        btn_layout.addWidget(self.btn_delete)
-        
-        # 4. 상태 표시
-        self.lbl_status = QLabel("상태: 대기 중")
-        self.lbl_status.setStyleSheet("color: #6C757D; font-size: 11px;")
-        
-        layout.addLayout(top_layout)
-        layout.addWidget(self.lbl_count)
-        layout.addLayout(btn_layout)
-        layout.addWidget(self.lbl_status)
-        self.setLayout(layout)
-
-    def refresh_ports(self):
-        """COM 포트 검색 및 DEVICE_MAP 기반 이름 자동 매핑"""
-        current_data = self.port_combo.currentData()
-        self.port_combo.clear()
-        ports = serial.tools.list_ports.comports()
-        
-        for p in ports:
-            sn = p.serial_number  # USB 고유 시리얼 번호
-            matched_name = None
-            
-            # DEVICE_MAP에 등록된 시리얼 번호인지 검사
-            if sn:
-                for target_sn, dev_name in DEVICE_MAP.items():
-                    if target_sn in sn:
-                        matched_name = dev_name
-                        break
-            
-            # 표시 텍스트 생성
-            if matched_name:
-                display_text = f"[{matched_name}] {p.device}"
-            else:
-                display_text = f"{p.device} ({p.description})"
-                
-            self.port_combo.addItem(display_text, p.device)
-            
-            # 시리얼 번호로 감지된 이름이 있다면 장비 이름 입력창에 자동 반영 (초기값 설정용)
-            if matched_name and not self.txt_name.text().strip():
-                self.txt_name.setText(matched_name)
-            
-        if current_data:
-            index = self.port_combo.findData(current_data)
-            if index >= 0:
-                self.port_combo.setCurrentIndex(index)
-
-    def toggle_connection(self):
-        if self.timer.isActive():
-            self.stop_connection()
-        else:
-            self.start_connection()
-
-    def start_connection(self):
-        port = self.port_combo.currentData()
-        if not port:
-            self.lbl_status.setText("상태: COM 포트 없음")
-            return False
-            
         # CT6Y 기본 통신 설정 (9600, Even, Data 8, Stop 1)
-        self.client = ModbusSerialClient(
+        client = ModbusSerialClient(
             port=port,
             baudrate=9600,
             parity='E',
@@ -145,80 +208,394 @@ class CounterCard(QGroupBox):
             bytesize=8,
             timeout=1
         )
-        
-        if self.client.connect():
-            self.timer.start(1000) # 1초 주기 데이터 읽기
-            self.btn_connect.setText("연결 끊기")
-            self.btn_connect.setStyleSheet("background-color: #2ECC71; color: white;")
-            self.lbl_status.setText(f"상태: {port} 연결됨 (수집 중)")
-            self.port_combo.setEnabled(False)
-            self.txt_name.setEnabled(False)
-            return True
+        try:
+            ok = client.connect()
+        except Exception:
+            ok = False
+
+        if ok:
+            self.client = client
+            self.connect_result.emit(True, port)
+            self.poll()
+            self.timer.start(POLL_INTERVAL_MS)
         else:
-            self.lbl_status.setText(f"상태: {port} 연결 실패")
-            return False
+            client.close()
+            self.connect_result.emit(False, port)
 
-    def stop_connection(self):
-        self.timer.stop()
-        if self.client:
-            self.client.close()
-        self.btn_connect.setText("연결 시작")
-        self.btn_connect.setStyleSheet("")
-        self.lbl_status.setText("상태: 연결 해제됨")
-        self.port_combo.setEnabled(True)
-        self.txt_name.setEnabled(True)
-
-    def update_counter(self):
+    @pyqtSlot()
+    def poll(self):
         if not self.client:
             return
-            
         try:
             # Holding Register 0000번지부터 2개 읽기 (32비트 카운트 값, Slave ID=1)
-            response = self.client.read_holding_registers(address=0, count=2, slave=1)
+            response = self.client.read_holding_registers(address=0, count=2, **{_UNIT_KW: SLAVE_ID})
             if not response.isError():
                 high = response.registers[0]
                 low = response.registers[1]
-                count_value = (high << 16) | low
-                
-                self.lbl_count.setText(f"{count_value:,}")
-                self.save_to_csv(count_value)
-                self.lbl_status.setText(f"상태: 수집 중 ({datetime.now().strftime('%H:%M:%S')})")
+                self.count_read.emit((high << 16) | low)
             else:
-                self.lbl_status.setText("상태: 데이터 응답 오류")
+                self.read_failed.emit("장비 응답 오류 — 통신 설정(9600/Even/8/1, ID 1)을 확인하세요.")
         except Exception as e:
-            self.lbl_status.setText(f"오류: {str(e)}")
+            self.read_failed.emit(f"오류: {str(e)}")
+
+    @pyqtSlot()
+    def reset(self):
+        if not self.client:
+            self.reset_result.emit(False)
+            return
+        try:
+            # Coil 0001번지(1)에 True 전송 -> RESET 실행
+            response = self.client.write_coil(address=1, value=True, **{_UNIT_KW: SLAVE_ID})
+            ok = not response.isError()
+        except Exception:
+            ok = False
+        self.reset_result.emit(ok)
+        if ok:
+            self.poll()
+
+    @pyqtSlot()
+    def close_port(self):
+        if self.timer:
+            self.timer.stop()
+        self.close_client()
+
+    @pyqtSlot()
+    def stop(self):
+        """포트를 닫고 워커 스레드의 이벤트 루프 종료 (앞서 요청된 작업이 끝난 뒤 실행됨)"""
+        if self.timer:
+            self.timer.stop()
+        self.close_client()
+        self.thread().quit()
+
+    def close_client(self):
+        if self.client:
+            try:
+                self.client.close()
+            except Exception:
+                pass
+            self.client = None
+
+
+class CounterCard(QFrame):
+    """개별 카운터 장비를 표시하고 제어하는 카드 위젯"""
+    # 워커 스레드로 작업을 요청하는 시그널 (큐 연결로 워커 스레드에서 실행됨)
+    request_open = pyqtSignal(str)
+    request_reset = pyqtSignal()
+    request_close = pyqtSignal()
+    request_stop = pyqtSignal()
+
+    def __init__(self, card_id, parent_app, default_name="", default_port=""):
+        super().__init__()
+        self.setObjectName("Card")
+        self.card_id = card_id
+        self.parent_app = parent_app
+        self.state = "idle"
+        self.running = False     # 연결되어 수집 중인지 여부
+        self.connecting = False  # 연결 시도 중 여부
+        self.port = None
+
+        self.initUI(default_name, default_port)
+        self.init_worker()
+
+    def init_worker(self):
+        # 카드가 먼저 삭제되어도 스레드가 안전하게 끝날 수 있도록 메인 창을 부모로 둠
+        self.thread = QThread(self.parent_app)
+        self.worker = ModbusWorker()
+        self.worker.moveToThread(self.thread)
+
+        self.request_open.connect(self.worker.open_port)
+        self.request_reset.connect(self.worker.reset)
+        self.request_close.connect(self.worker.close_port)
+        self.request_stop.connect(self.worker.stop)
+        self.thread.finished.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self.thread.deleteLater)
+
+        self.worker.connect_result.connect(self.on_connect_result)
+        self.worker.count_read.connect(self.on_count_read)
+        self.worker.read_failed.connect(self.on_read_failed)
+        self.worker.reset_result.connect(self.on_reset_result)
+
+        self.thread.start()
+
+    def shutdown(self):
+        """통신 스레드 종료 요청 (진행 중인 통신이 끝나면 포트를 닫고 스스로 종료)"""
+        self.running = False
+        self.connecting = False
+        self.request_stop.emit()
+
+    def initUI(self, default_name, default_port):
+        self.setMinimumWidth(CARD_MIN_WIDTH)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(18)
+        shadow.setOffset(0, 2)
+        shadow.setColor(QColor(15, 23, 42, 25))
+        self.setGraphicsEffect(shadow)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 14, 18, 16)
+        layout.setSpacing(12)
+
+        # 1. 헤더: 장비 번호 / 이름 / 상태 배지 / 삭제
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        lbl_id = QLabel(f"#{self.card_id}")
+        lbl_id.setObjectName("CardId")
+
+        self.txt_name = QLineEdit(default_name if default_name else f"카운터_{self.card_id}")
+        self.txt_name.setObjectName("NameEdit")
+        self.txt_name.setPlaceholderText("장비 이름")
+        self.txt_name.setToolTip("클릭하여 장비 이름 수정")
+
+        self.lbl_badge = QLabel()
+        self.lbl_badge.setAlignment(Qt.AlignCenter)
+
+        self.btn_delete = QPushButton("✕")
+        self.btn_delete.setObjectName("IconDanger")
+        self.btn_delete.setToolTip("이 카운터 삭제")
+        self.btn_delete.setCursor(Qt.PointingHandCursor)
+        self.btn_delete.clicked.connect(self.confirm_delete)
+
+        header.addWidget(lbl_id)
+        header.addWidget(self.txt_name, 1)
+        header.addWidget(self.lbl_badge)
+        header.addWidget(self.btn_delete)
+
+        # 2. 포트 선택
+        port_row = QHBoxLayout()
+        port_row.setSpacing(6)
+        lbl_port = QLabel("COM 포트")
+        lbl_port.setObjectName("FieldLabel")
+
+        self.port_combo = QComboBox()
+        self.port_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.refresh_ports()
+
+        # 이전 저장 포트 선택
+        if default_port:
+            index = self.port_combo.findData(default_port)
+            if index >= 0:
+                self.port_combo.setCurrentIndex(index)
+
+        self.btn_refresh = QPushButton("⟳")
+        self.btn_refresh.setObjectName("Icon")
+        self.btn_refresh.setToolTip("포트 목록 새로고침")
+        self.btn_refresh.setCursor(Qt.PointingHandCursor)
+        self.btn_refresh.clicked.connect(self.refresh_ports)
+
+        port_row.addWidget(lbl_port)
+        port_row.addWidget(self.port_combo, 1)
+        port_row.addWidget(self.btn_refresh)
+
+        # 3. 실시간 카운트 수 표시
+        count_box = QVBoxLayout()
+        count_box.setSpacing(4)
+        self.lbl_count = QLabel("0")
+        self.lbl_count.setObjectName("Count")
+        self.lbl_count.setAlignment(Qt.AlignCenter)
+        self.lbl_count.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        self.lbl_updated = QLabel("마지막 수신: -")
+        self.lbl_updated.setObjectName("CountUnit")
+        self.lbl_updated.setAlignment(Qt.AlignRight)
+        count_box.addWidget(self.lbl_count)
+        count_box.addWidget(self.lbl_updated)
+
+        # 4. 제어 버튼들
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(8)
+        self.btn_connect = QPushButton("▶  연결 시작")
+        self.btn_connect.setObjectName("Connect")
+        self.btn_connect.setCursor(Qt.PointingHandCursor)
+        self.btn_connect.clicked.connect(self.toggle_connection)
+
+        self.btn_reset = QPushButton("↺  0 리셋")
+        self.btn_reset.setObjectName("Danger")
+        self.btn_reset.setCursor(Qt.PointingHandCursor)
+        self.btn_reset.setToolTip("카운터 값을 0으로 초기화 (연결 중에만 가능)")
+        self.btn_reset.clicked.connect(self.reset_counter)
+
+        btn_layout.addWidget(self.btn_connect, 2)
+        btn_layout.addWidget(self.btn_reset, 1)
+
+        # 5. 상태 표시
+        self.lbl_status = QLabel("대기 중")
+        self.lbl_status.setObjectName("StatusText")
+        self.lbl_status.setWordWrap(True)
+
+        layout.addLayout(header)
+        layout.addLayout(port_row)
+        layout.addLayout(count_box)
+        layout.addLayout(btn_layout)
+        layout.addWidget(self.lbl_status)
+
+        self.set_state("idle", "대기 중")
+
+    def set_state(self, state, message=None):
+        """상태 배지 / 카운트 색상 / 버튼 활성화 상태를 일괄 갱신"""
+        self.state = state
+        text, fg, bg, count_color = STATUS_STYLES[state]
+        self.lbl_badge.setText(text)
+        self.lbl_badge.setStyleSheet(
+            f"color: {fg}; background-color: {bg}; border-radius: 10px; "
+            f"padding: 3px 10px; font-size: 11px; font-weight: bold;")
+        self.lbl_count.setStyleSheet(f"color: {count_color};")
+        if message is not None:
+            self.lbl_status.setText(message)
+
+        running = self.running
+        locked = running or self.connecting
+        self.btn_reset.setEnabled(running)
+        self.btn_connect.setEnabled(not self.connecting)
+        self.port_combo.setEnabled(not locked)
+        self.btn_refresh.setEnabled(not locked)
+        self.txt_name.setEnabled(not locked)
+        self.btn_connect.setText("■  연결 끊기" if running else "▶  연결 시작")
+        self.btn_connect.setProperty("connected", "true" if running else "false")
+        repolish(self.btn_connect)
+
+        self.parent_app.update_summary()
+
+    def refresh_ports(self):
+        """COM 포트 검색 및 DEVICE_MAP 기반 이름 자동 매핑"""
+        current_data = self.port_combo.currentData()
+        self.port_combo.clear()
+        ports = serial.tools.list_ports.comports()
+
+        for p in ports:
+            sn = p.serial_number  # USB 고유 시리얼 번호
+            matched_name = None
+
+            # DEVICE_MAP에 등록된 시리얼 번호인지 검사
+            if sn:
+                for target_sn, dev_name in DEVICE_MAP.items():
+                    if target_sn in sn:
+                        matched_name = dev_name
+                        break
+
+            # 표시 텍스트 생성
+            if matched_name:
+                display_text = f"[{matched_name}] {p.device}"
+            else:
+                display_text = f"{p.device} ({p.description})"
+
+            self.port_combo.addItem(display_text, p.device)
+            self.port_combo.setItemData(self.port_combo.count() - 1,
+                                        f"{p.device}\n{p.description}\nS/N: {sn or '-'}", Qt.ToolTipRole)
+
+            # 시리얼 번호로 감지된 이름이 있다면 장비 이름 입력창에 자동 반영 (초기값 설정용)
+            if matched_name and not self.txt_name.text().strip():
+                self.txt_name.setText(matched_name)
+
+        if self.port_combo.count() == 0:
+            self.port_combo.addItem("감지된 COM 포트 없음", None)
+
+        if current_data:
+            index = self.port_combo.findData(current_data)
+            if index >= 0:
+                self.port_combo.setCurrentIndex(index)
+
+    def toggle_connection(self):
+        if self.running:
+            self.stop_connection()
+        elif not self.connecting:
+            self.start_connection()
+
+    def start_connection(self):
+        port = self.port_combo.currentData()
+        if not port:
+            self.set_state("error", "COM 포트를 선택해 주세요.")
+            return False
+
+        self.port = port
+        self.connecting = True
+        self.set_state("connecting", f"{port} 연결 시도 중...")
+        self.request_open.emit(port)
+        return True
+
+    def stop_connection(self):
+        was_active = self.running or self.connecting
+        self.running = False
+        self.connecting = False
+        if was_active:
+            self.request_close.emit()
+        self.set_state("idle", "연결 해제됨")
+
+    @pyqtSlot(bool, str)
+    def on_connect_result(self, ok, port):
+        if not self.connecting or port != self.port:
+            # 사용자가 연결 시도 중에 취소한 경우 등 - 결과 무시
+            return
+        self.connecting = False
+        if ok:
+            self.running = True
+            self.set_state("connected", f"{port} 연결됨 · 1초 주기로 수집 중")
+        else:
+            self.set_state("error", f"{port} 연결 실패 — 케이블/포트 사용 여부를 확인하세요.")
+
+    @pyqtSlot(int)
+    def on_count_read(self, count_value):
+        if not self.running:
+            return  # 연결 해제 직후 도착한 이전 결과 무시
+        now = datetime.now()
+        self.lbl_count.setText(f"{count_value:,}")
+        self.lbl_updated.setText(f"마지막 수신: {now.strftime('%H:%M:%S')}")
+        try:
+            self.save_to_csv(count_value)
+        except OSError as e:
+            self.parent_app.show_message(f"CSV 저장 실패: {e}")
+        if self.state != "connected":
+            self.set_state("connected")
+        self.lbl_status.setText(f"{self.port} 연결됨 · 1초 주기로 수집 중")
+
+    @pyqtSlot(str)
+    def on_read_failed(self, message):
+        if not self.running:
+            return
+        self.set_state("warning", message)
 
     def save_to_csv(self, count):
         device_name = self.txt_name.text().strip().replace(" ", "_")
         filename = f"counter_log_{device_name}_{datetime.now().strftime('%Y%m%d')}.csv"
-        
+
         file_exists = os.path.exists(filename)
         with open(filename, mode='a', newline='', encoding='utf-8-sig') as f:
             writer = csv.writer(f)
             if not file_exists:
                 writer.writerow(["일시", "장비명", "COM포트", "카운트 수"])
-            writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), self.txt_name.text(), self.port_combo.currentData(), count])
+            writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), self.txt_name.text(), self.port, count])
 
     def reset_counter(self):
-        if not self.client or not self.client.connected:
+        if not self.running:
             QMessageBox.warning(self, "경고", "연결된 상태에서만 리셋이 가능합니다.")
             return
-            
+
         reply = QMessageBox.question(self, '확인', f"[{self.txt_name.text()}] 카운트 수치를 0으로 초기화하시겠습니까?",
                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes and self.running:
+            self.btn_reset.setEnabled(False)
+            self.request_reset.emit()
+
+    @pyqtSlot(bool)
+    def on_reset_result(self, ok):
+        self.btn_reset.setEnabled(self.running)
+        if ok:
+            self.parent_app.show_message(f"[{self.txt_name.text()}] 0으로 리셋되었습니다.")
+        else:
+            QMessageBox.critical(self, "오류", "리셋 전송에 실패했습니다.")
+
+    def confirm_delete(self):
+        reply = QMessageBox.question(self, '삭제 확인', f"[{self.txt_name.text()}] 카운터를 목록에서 삭제하시겠습니까?",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply == QMessageBox.Yes:
-            # Coil 0001번지(1)에 True 전송 -> RESET 실행
-            response = self.client.write_coil(address=1, value=True, slave=1)
-            if not response.isError():
-                QMessageBox.information(self, "성공", "0으로 리셋되었습니다.")
-            else:
-                QMessageBox.critical(self, "오류", "리셋 전송에 실패했습니다.")
+            self.parent_app.remove_counter_card(self)
 
     def get_config(self):
         return {
             "name": self.txt_name.text(),
             "port": self.port_combo.currentData(),
-            "auto_connect": self.timer.isActive()
+            "auto_connect": self.running or self.connecting
         }
 
 
@@ -227,78 +604,157 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.cards = []
         self.next_card_id = 1
+        self.columns = 2
         self.initUI()
         self.load_config_and_autoconnect()
 
+        # 상단 시계 갱신
+        self.clock_timer = QTimer(self)
+        self.clock_timer.timeout.connect(self.update_clock)
+        self.clock_timer.start(1000)
+        self.update_clock()
+
     def initUI(self):
         self.setWindowTitle("오토닉스 다중 카운터 실시간 모니터링 프로그램")
-        self.resize(900, 600)
-        
+        self.resize(980, 680)
+        self.setMinimumSize(460, 420)
+
         main_widget = QWidget()
+        main_widget.setObjectName("Central")
         self.setCentralWidget(main_widget)
         main_layout = QVBoxLayout(main_widget)
-        
-        # 상단 제어바
+        main_layout.setContentsMargins(20, 18, 20, 10)
+        main_layout.setSpacing(14)
+
+        # 상단 헤더: 제목 / 요약 / 제어 버튼
         top_bar = QHBoxLayout()
-        btn_add = QPushButton("+ 카운터 장비 추가")
-        btn_add.setFont(QFont("맑은 고딕", 10, QFont.Bold))
-        btn_add.setStyleSheet("background-color: #3498DB; color: white; padding: 8px;")
-        btn_add.clicked.connect(self.add_counter_card)
-        
-        btn_refresh_all = QPushButton("포트 목록 전체 새로고침")
+        top_bar.setSpacing(10)
+
+        title_box = QVBoxLayout()
+        title_box.setSpacing(2)
+        lbl_title = QLabel("카운터 모니터링")
+        lbl_title.setObjectName("Title")
+        self.lbl_clock = QLabel()
+        self.lbl_clock.setObjectName("Subtitle")
+        title_box.addWidget(lbl_title)
+
+        self.lbl_summary = QLabel()
+        self.lbl_summary.setObjectName("Summary")
+
+        btn_refresh_all = QPushButton("⟳  포트 새로고침")
+        btn_refresh_all.setCursor(Qt.PointingHandCursor)
+        btn_refresh_all.setToolTip("연결되지 않은 모든 카드의 COM 포트 목록을 다시 검색합니다.")
         btn_refresh_all.clicked.connect(self.refresh_all_ports)
-        
-        top_bar.addWidget(btn_add)
-        top_bar.addWidget(btn_refresh_all)
+
+        btn_add = QPushButton("+  카운터 추가")
+        btn_add.setObjectName("Primary")
+        btn_add.setCursor(Qt.PointingHandCursor)
+        btn_add.clicked.connect(lambda: self.add_counter_card())
+
+        top_bar.addLayout(title_box)
         top_bar.addStretch()
-        
+        top_bar.addWidget(btn_refresh_all)
+        top_bar.addWidget(btn_add)
+
+        # 요약 바: 현재 시각 / 연결 현황
+        info_bar = QHBoxLayout()
+        info_bar.addWidget(self.lbl_clock)
+        info_bar.addStretch()
+        info_bar.addWidget(self.lbl_summary)
+
         # 스크롤 가능한 카드 배치 영역
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
         self.scroll_content = QWidget()
+        self.scroll_content.setObjectName("ScrollContent")
         self.grid_layout = QGridLayout(self.scroll_content)
-        scroll.setWidget(self.scroll_content)
-        
+        self.grid_layout.setContentsMargins(6, 6, 6, 6)
+        self.grid_layout.setSpacing(16)
+        self.grid_layout.setAlignment(Qt.AlignTop)
+        self.scroll.setWidget(self.scroll_content)
+
+        self.scroll.viewport().installEventFilter(self)
+
         main_layout.addLayout(top_bar)
-        main_layout.addWidget(scroll)
+        main_layout.addLayout(info_bar)
+        main_layout.addWidget(self.scroll)
+
+        self.setStatusBar(QStatusBar())
+        self.statusBar().showMessage(f"로그 저장 위치: {os.path.abspath('.')}")
+
+    def update_clock(self):
+        self.lbl_clock.setText(datetime.now().strftime("%Y-%m-%d (%a) %H:%M:%S"))
+
+    def update_summary(self):
+        if not hasattr(self, "lbl_summary"):
+            return
+        total = len(self.cards)
+        connected = sum(1 for c in self.cards if c.state == "connected")
+        problem = sum(1 for c in self.cards if c.state in ("warning", "error"))
+        text = f"<span style='color:{COLORS['success']}'>●</span> 수집 중 <b>{connected}</b> / 전체 <b>{total}</b>"
+        if problem:
+            text += f"&nbsp;&nbsp;<span style='color:{COLORS['danger']}'>●</span> 이상 <b>{problem}</b>"
+        self.lbl_summary.setText(text)
+
+    def show_message(self, text, timeout=5000):
+        self.statusBar().showMessage(text, timeout)
 
     def add_counter_card(self, name="", port="", auto_connect=False):
         card = CounterCard(self.next_card_id, self, default_name=name, default_port=port)
         self.cards.append(card)
-        
-        row = (len(self.cards) - 1) // 2
-        col = (len(self.cards) - 1) % 2
-        self.grid_layout.addWidget(card, row, col)
-        
         self.next_card_id += 1
-        
+        self.rearrange_grid()
+        self.update_summary()
+
         # 이전 상태가 연결 중이었다면 자동 연결 수행
         if auto_connect:
             card.start_connection()
 
     def remove_counter_card(self, card):
         card.stop_connection()
+        card.shutdown()  # 스레드는 백그라운드에서 정리되므로 화면이 멈추지 않음
         self.grid_layout.removeWidget(card)
         self.cards.remove(card)
         card.deleteLater()
         self.rearrange_grid()
+        self.update_summary()
 
     def rearrange_grid(self):
-        for i, card in enumerate(self.cards):
+        for card in self.cards:
             self.grid_layout.removeWidget(card)
-            row = i // 2
-            col = i % 2
-            self.grid_layout.addWidget(card, row, col)
+        for c in range(self.grid_layout.columnCount()):
+            self.grid_layout.setColumnStretch(c, 0)
+        for i, card in enumerate(self.cards):
+            self.grid_layout.addWidget(card, i // self.columns, i % self.columns)
+        for c in range(self.columns):
+            self.grid_layout.setColumnStretch(c, 1)
+
+    def eventFilter(self, obj, event):
+        # 창 너비에 맞춰 한 줄에 표시할 카드 수를 자동 조절
+        if obj is self.scroll.viewport() and event.type() == QEvent.Resize:
+            self.update_columns()
+        return super().eventFilter(obj, event)
+
+    def update_columns(self):
+        available = self.scroll.viewport().width() - 8
+        spacing = self.grid_layout.spacing()
+        columns = max(1, (available + spacing) // (CARD_MIN_WIDTH + spacing))
+        if columns != self.columns:
+            self.columns = columns
+            self.rearrange_grid()
 
     def refresh_all_ports(self):
         for card in self.cards:
-            card.refresh_ports()
+            if not (card.running or card.connecting):
+                card.refresh_ports()
+        self.show_message("COM 포트 목록을 새로고침했습니다.")
 
     def save_config(self):
         config_data = []
         for card in self.cards:
             config_data.append(card.get_config())
-            
+
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(config_data, f, ensure_ascii=False, indent=4)
 
@@ -307,7 +763,7 @@ class MainWindow(QMainWindow):
             try:
                 with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                     config_data = json.load(f)
-                    
+
                 for item in config_data:
                     self.add_counter_card(
                         name=item.get("name", ""),
@@ -316,18 +772,29 @@ class MainWindow(QMainWindow):
                     )
             except Exception as e:
                 print(f"설정 로드 오류: {e}")
-        
+
         if not self.cards:
             self.add_counter_card()
 
     def closeEvent(self, event):
         self.save_config()
+        self.clock_timer.stop()
+        # 모든 스레드에 종료를 먼저 요청한 뒤 한꺼번에 대기 (종료 시간 단축)
         for card in self.cards:
-            card.stop_connection()
+            card.shutdown()
+        # 삭제된 카드의 정리 중인 스레드까지 포함해 모든 통신 스레드 종료 대기
+        for thread in self.findChildren(QThread):
+            thread.wait(8000)
         event.accept()
 
 if __name__ == "__main__":
+    if hasattr(Qt, "AA_EnableHighDpiScaling"):
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setFont(QFont("맑은 고딕", 10))
+    app.setStyleSheet(APP_STYLE)
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())
