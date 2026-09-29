@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QComboBox,
                              QMessageBox, QFrame, QGridLayout, QScrollArea, QLineEdit,
                              QGraphicsDropShadowEffect, QSizePolicy, QStatusBar)
-from PyQt5.QtCore import QTimer, Qt, QEvent
+from PyQt5.QtCore import QTimer, Qt, QEvent, QObject, QThread, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QFont, QColor
 import serial.tools.list_ports
 from pymodbus.client import ModbusSerialClient
@@ -29,6 +29,7 @@ DEVICE_MAP = {
 _UNIT_KW = ("device_id" if "device_id" in inspect.signature(ModbusSerialClient.read_holding_registers).parameters
             else "slave")
 SLAVE_ID = 1
+POLL_INTERVAL_MS = 1000  # 데이터 읽기 주기
 
 CARD_MIN_WIDTH = 360
 
@@ -56,6 +57,7 @@ COLORS = {
 # 상태별 (배지 텍스트, 글자색, 배경색, 카운트 숫자색)
 STATUS_STYLES = {
     "idle":      ("● 대기",   COLORS["muted"],   COLORS["idle_bg"],    "#9CA3AF"),
+    "connecting": ("● 연결 중", COLORS["primary"], "#DBEAFE",           "#9CA3AF"),
     "connected": ("● 수집 중", COLORS["success"], COLORS["success_bg"], COLORS["primary"]),
     "warning":   ("● 응답 오류", COLORS["warn"],  COLORS["warn_bg"],    COLORS["warn"]),
     "error":     ("● 연결 실패", COLORS["danger"], COLORS["danger_bg"], "#9CA3AF"),
@@ -175,20 +177,151 @@ def repolish(widget):
     widget.style().polish(widget)
 
 
+class ModbusWorker(QObject):
+    """별도 스레드에서 Modbus 통신(연결/주기 읽기/리셋)을 담당.
+    UI 스레드와는 시그널로만 주고받으므로 통신 지연이 화면을 멈추지 않는다."""
+    connect_result = pyqtSignal(bool, str)   # 성공 여부, 포트
+    count_read = pyqtSignal(int)
+    read_failed = pyqtSignal(str)
+    reset_result = pyqtSignal(bool)
+
+    def __init__(self):
+        super().__init__()
+        self.client = None
+        self.timer = None
+
+    @pyqtSlot(str)
+    def open_port(self, port):
+        # 타이머는 워커 스레드 안에서 생성해야 해당 스레드에서 동작함
+        if self.timer is None:
+            self.timer = QTimer(self)
+            self.timer.timeout.connect(self.poll)
+        self.timer.stop()
+        self.close_client()
+
+        # CT6Y 기본 통신 설정 (9600, Even, Data 8, Stop 1)
+        client = ModbusSerialClient(
+            port=port,
+            baudrate=9600,
+            parity='E',
+            stopbits=1,
+            bytesize=8,
+            timeout=1
+        )
+        try:
+            ok = client.connect()
+        except Exception:
+            ok = False
+
+        if ok:
+            self.client = client
+            self.connect_result.emit(True, port)
+            self.poll()
+            self.timer.start(POLL_INTERVAL_MS)
+        else:
+            client.close()
+            self.connect_result.emit(False, port)
+
+    @pyqtSlot()
+    def poll(self):
+        if not self.client:
+            return
+        try:
+            # Holding Register 0000번지부터 2개 읽기 (32비트 카운트 값, Slave ID=1)
+            response = self.client.read_holding_registers(address=0, count=2, **{_UNIT_KW: SLAVE_ID})
+            if not response.isError():
+                high = response.registers[0]
+                low = response.registers[1]
+                self.count_read.emit((high << 16) | low)
+            else:
+                self.read_failed.emit("장비 응답 오류 — 통신 설정(9600/Even/8/1, ID 1)을 확인하세요.")
+        except Exception as e:
+            self.read_failed.emit(f"오류: {str(e)}")
+
+    @pyqtSlot()
+    def reset(self):
+        if not self.client:
+            self.reset_result.emit(False)
+            return
+        try:
+            # Coil 0001번지(1)에 True 전송 -> RESET 실행
+            response = self.client.write_coil(address=1, value=True, **{_UNIT_KW: SLAVE_ID})
+            ok = not response.isError()
+        except Exception:
+            ok = False
+        self.reset_result.emit(ok)
+        if ok:
+            self.poll()
+
+    @pyqtSlot()
+    def close_port(self):
+        if self.timer:
+            self.timer.stop()
+        self.close_client()
+
+    @pyqtSlot()
+    def stop(self):
+        """포트를 닫고 워커 스레드의 이벤트 루프 종료 (앞서 요청된 작업이 끝난 뒤 실행됨)"""
+        if self.timer:
+            self.timer.stop()
+        self.close_client()
+        self.thread().quit()
+
+    def close_client(self):
+        if self.client:
+            try:
+                self.client.close()
+            except Exception:
+                pass
+            self.client = None
+
+
 class CounterCard(QFrame):
     """개별 카운터 장비를 표시하고 제어하는 카드 위젯"""
+    # 워커 스레드로 작업을 요청하는 시그널 (큐 연결로 워커 스레드에서 실행됨)
+    request_open = pyqtSignal(str)
+    request_reset = pyqtSignal()
+    request_close = pyqtSignal()
+    request_stop = pyqtSignal()
+
     def __init__(self, card_id, parent_app, default_name="", default_port=""):
         super().__init__()
         self.setObjectName("Card")
         self.card_id = card_id
         self.parent_app = parent_app
         self.state = "idle"
-
-        self.client = None
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_counter)
+        self.running = False     # 연결되어 수집 중인지 여부
+        self.connecting = False  # 연결 시도 중 여부
+        self.port = None
 
         self.initUI(default_name, default_port)
+        self.init_worker()
+
+    def init_worker(self):
+        # 카드가 먼저 삭제되어도 스레드가 안전하게 끝날 수 있도록 메인 창을 부모로 둠
+        self.thread = QThread(self.parent_app)
+        self.worker = ModbusWorker()
+        self.worker.moveToThread(self.thread)
+
+        self.request_open.connect(self.worker.open_port)
+        self.request_reset.connect(self.worker.reset)
+        self.request_close.connect(self.worker.close_port)
+        self.request_stop.connect(self.worker.stop)
+        self.thread.finished.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self.thread.deleteLater)
+
+        self.worker.connect_result.connect(self.on_connect_result)
+        self.worker.count_read.connect(self.on_count_read)
+        self.worker.read_failed.connect(self.on_read_failed)
+        self.worker.reset_result.connect(self.on_reset_result)
+
+        self.thread.start()
+
+    def shutdown(self):
+        """통신 스레드 종료 요청 (진행 중인 통신이 끝나면 포트를 닫고 스스로 종료)"""
+        self.running = False
+        self.connecting = False
+        self.request_stop.emit()
 
     def initUI(self, default_name, default_port):
         self.setMinimumWidth(CARD_MIN_WIDTH)
@@ -311,11 +444,13 @@ class CounterCard(QFrame):
         if message is not None:
             self.lbl_status.setText(message)
 
-        running = self.timer.isActive()
+        running = self.running
+        locked = running or self.connecting
         self.btn_reset.setEnabled(running)
-        self.port_combo.setEnabled(not running)
-        self.btn_refresh.setEnabled(not running)
-        self.txt_name.setEnabled(not running)
+        self.btn_connect.setEnabled(not self.connecting)
+        self.port_combo.setEnabled(not locked)
+        self.btn_refresh.setEnabled(not locked)
+        self.txt_name.setEnabled(not locked)
         self.btn_connect.setText("■  연결 끊기" if running else "▶  연결 시작")
         self.btn_connect.setProperty("connected", "true" if running else "false")
         repolish(self.btn_connect)
@@ -362,9 +497,9 @@ class CounterCard(QFrame):
                 self.port_combo.setCurrentIndex(index)
 
     def toggle_connection(self):
-        if self.timer.isActive():
+        if self.running:
             self.stop_connection()
-        else:
+        elif not self.connecting:
             self.start_connection()
 
     def start_connection(self):
@@ -373,56 +508,52 @@ class CounterCard(QFrame):
             self.set_state("error", "COM 포트를 선택해 주세요.")
             return False
 
-        # CT6Y 기본 통신 설정 (9600, Even, Data 8, Stop 1)
-        self.client = ModbusSerialClient(
-            port=port,
-            baudrate=9600,
-            parity='E',
-            stopbits=1,
-            bytesize=8,
-            timeout=1
-        )
-
-        if self.client.connect():
-            self.timer.start(1000) # 1초 주기 데이터 읽기
-            self.set_state("connected", f"{port} 연결됨 · 1초 주기로 수집 중")
-            self.update_counter()
-            return True
-        else:
-            self.client = None
-            self.set_state("error", f"{port} 연결 실패 — 케이블/포트 사용 여부를 확인하세요.")
-            return False
+        self.port = port
+        self.connecting = True
+        self.set_state("connecting", f"{port} 연결 시도 중...")
+        self.request_open.emit(port)
+        return True
 
     def stop_connection(self):
-        self.timer.stop()
-        if self.client:
-            self.client.close()
-            self.client = None
+        was_active = self.running or self.connecting
+        self.running = False
+        self.connecting = False
+        if was_active:
+            self.request_close.emit()
         self.set_state("idle", "연결 해제됨")
 
-    def update_counter(self):
-        if not self.client:
+    @pyqtSlot(bool, str)
+    def on_connect_result(self, ok, port):
+        if not self.connecting or port != self.port:
+            # 사용자가 연결 시도 중에 취소한 경우 등 - 결과 무시
             return
+        self.connecting = False
+        if ok:
+            self.running = True
+            self.set_state("connected", f"{port} 연결됨 · 1초 주기로 수집 중")
+        else:
+            self.set_state("error", f"{port} 연결 실패 — 케이블/포트 사용 여부를 확인하세요.")
 
+    @pyqtSlot(int)
+    def on_count_read(self, count_value):
+        if not self.running:
+            return  # 연결 해제 직후 도착한 이전 결과 무시
+        now = datetime.now()
+        self.lbl_count.setText(f"{count_value:,}")
+        self.lbl_updated.setText(f"마지막 수신: {now.strftime('%H:%M:%S')}")
         try:
-            # Holding Register 0000번지부터 2개 읽기 (32비트 카운트 값, Slave ID=1)
-            response = self.client.read_holding_registers(address=0, count=2, **{_UNIT_KW: SLAVE_ID})
-            if not response.isError():
-                high = response.registers[0]
-                low = response.registers[1]
-                count_value = (high << 16) | low
+            self.save_to_csv(count_value)
+        except OSError as e:
+            self.parent_app.show_message(f"CSV 저장 실패: {e}")
+        if self.state != "connected":
+            self.set_state("connected")
+        self.lbl_status.setText(f"{self.port} 연결됨 · 1초 주기로 수집 중")
 
-                now = datetime.now()
-                self.lbl_count.setText(f"{count_value:,}")
-                self.lbl_updated.setText(f"마지막 수신: {now.strftime('%H:%M:%S')}")
-                self.save_to_csv(count_value)
-                if self.state != "connected":
-                    self.set_state("connected")
-                self.lbl_status.setText(f"{self.port_combo.currentData()} 연결됨 · 1초 주기로 수집 중")
-            else:
-                self.set_state("warning", "장비 응답 오류 — 통신 설정(9600/Even/8/1, ID 1)을 확인하세요.")
-        except Exception as e:
-            self.set_state("warning", f"오류: {str(e)}")
+    @pyqtSlot(str)
+    def on_read_failed(self, message):
+        if not self.running:
+            return
+        self.set_state("warning", message)
 
     def save_to_csv(self, count):
         device_name = self.txt_name.text().strip().replace(" ", "_")
@@ -433,23 +564,26 @@ class CounterCard(QFrame):
             writer = csv.writer(f)
             if not file_exists:
                 writer.writerow(["일시", "장비명", "COM포트", "카운트 수"])
-            writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), self.txt_name.text(), self.port_combo.currentData(), count])
+            writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), self.txt_name.text(), self.port, count])
 
     def reset_counter(self):
-        if not self.client or not self.client.connected:
+        if not self.running:
             QMessageBox.warning(self, "경고", "연결된 상태에서만 리셋이 가능합니다.")
             return
 
         reply = QMessageBox.question(self, '확인', f"[{self.txt_name.text()}] 카운트 수치를 0으로 초기화하시겠습니까?",
                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply == QMessageBox.Yes:
-            # Coil 0001번지(1)에 True 전송 -> RESET 실행
-            response = self.client.write_coil(address=1, value=True, **{_UNIT_KW: SLAVE_ID})
-            if not response.isError():
-                self.update_counter()
-                self.parent_app.show_message(f"[{self.txt_name.text()}] 0으로 리셋되었습니다.")
-            else:
-                QMessageBox.critical(self, "오류", "리셋 전송에 실패했습니다.")
+        if reply == QMessageBox.Yes and self.running:
+            self.btn_reset.setEnabled(False)
+            self.request_reset.emit()
+
+    @pyqtSlot(bool)
+    def on_reset_result(self, ok):
+        self.btn_reset.setEnabled(self.running)
+        if ok:
+            self.parent_app.show_message(f"[{self.txt_name.text()}] 0으로 리셋되었습니다.")
+        else:
+            QMessageBox.critical(self, "오류", "리셋 전송에 실패했습니다.")
 
     def confirm_delete(self):
         reply = QMessageBox.question(self, '삭제 확인', f"[{self.txt_name.text()}] 카운터를 목록에서 삭제하시겠습니까?",
@@ -461,7 +595,7 @@ class CounterCard(QFrame):
         return {
             "name": self.txt_name.text(),
             "port": self.port_combo.currentData(),
-            "auto_connect": self.timer.isActive()
+            "auto_connect": self.running or self.connecting
         }
 
 
@@ -579,6 +713,7 @@ class MainWindow(QMainWindow):
 
     def remove_counter_card(self, card):
         card.stop_connection()
+        card.shutdown()  # 스레드는 백그라운드에서 정리되므로 화면이 멈추지 않음
         self.grid_layout.removeWidget(card)
         self.cards.remove(card)
         card.deleteLater()
@@ -611,7 +746,7 @@ class MainWindow(QMainWindow):
 
     def refresh_all_ports(self):
         for card in self.cards:
-            if not card.timer.isActive():
+            if not (card.running or card.connecting):
                 card.refresh_ports()
         self.show_message("COM 포트 목록을 새로고침했습니다.")
 
@@ -643,8 +778,13 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.save_config()
+        self.clock_timer.stop()
+        # 모든 스레드에 종료를 먼저 요청한 뒤 한꺼번에 대기 (종료 시간 단축)
         for card in self.cards:
-            card.stop_connection()
+            card.shutdown()
+        # 삭제된 카드의 정리 중인 스레드까지 포함해 모든 통신 스레드 종료 대기
+        for thread in self.findChildren(QThread):
+            thread.wait(8000)
         event.accept()
 
 if __name__ == "__main__":
