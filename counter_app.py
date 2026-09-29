@@ -753,6 +753,10 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.lbl_station)
         if self.settings.errors:
             self.on_storage_status("설정 오류: " + " / ".join(self.settings.errors), "error")
+        if self.settings.added:
+            names = ", ".join(k.split(".", 1)[1] for k in self.settings.added)
+            QTimer.singleShot(0, lambda: self.show_message(
+                f"{SETTINGS_FILE} 에 새 설정 항목을 추가했습니다 (기본값): {names}", 20000))
 
     @pyqtSlot(str, str)
     def on_storage_status(self, text, level):

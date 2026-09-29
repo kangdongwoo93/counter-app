@@ -116,12 +116,67 @@ def _read_text(path):
     raise ValueError("설정 파일 인코딩을 읽을 수 없습니다 (UTF-8 로 저장하세요)")
 
 
+def _default_blocks():
+    """DEFAULT_SETTINGS 를 섹션별 (키, 설명 주석 + 키 줄) 목록으로 분리"""
+    sections, section, buf = {}, None, []
+    for line in DEFAULT_SETTINGS.splitlines():
+        text = line.strip()
+        if text.startswith("[") and text.endswith("]"):
+            section = text[1:-1]
+            sections[section] = []
+            buf = []
+        elif not text:
+            buf = []
+        elif text.startswith(";"):
+            buf.append(line)
+        elif section and "=" in text:
+            key = text.split("=", 1)[0].strip().lower()
+            sections[section].append((key, buf + [line]))
+            buf = []
+    return sections
+
+
+def add_missing_settings(path):
+    """기존 settings.ini 에 없는 (새 버전에서 추가된) 항목을 기본값과 설명과 함께 추가.
+    사용자가 수정한 기존 값은 그대로 유지한다. 추가된 항목 이름 목록을 반환."""
+    text = _read_text(path)
+    cp = configparser.ConfigParser(interpolation=None)
+    cp.read_string(text)
+    lines = text.splitlines()
+    added = []
+
+    for section, blocks in _default_blocks().items():
+        missing = [(k, b) for k, b in blocks if not (cp.has_section(section) and cp.has_option(section, k))]
+        if not missing:
+            continue
+        insert = ["", "; ↓ 새 버전에서 추가된 설정 (자동 추가됨)"]
+        for key, block in missing:
+            insert += block + [""]
+            added.append(f"{section}.{key}")
+
+        header = next((i for i, l in enumerate(lines) if l.strip().lower() == f"[{section}]"), None)
+        if header is None:
+            lines += ["", f"[{section}]"] + insert[1:]
+            continue
+        # 해당 섹션의 끝(다음 섹션 시작 전, 뒤쪽 빈 줄 제외) 위치에 삽입
+        end = next((i for i in range(header + 1, len(lines)) if lines[i].strip().startswith("[")), len(lines))
+        while end > header + 1 and not lines[end - 1].strip():
+            end -= 1
+        lines[end:end] = insert[:-1]
+
+    if added:
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            f.write("\r\n".join(lines) + "\r\n")
+    return added
+
+
 class Settings:
     """settings.ini 를 읽어 속성으로 제공. 파일이 없으면 기본 파일을 만든다."""
 
     def __init__(self, path=SETTINGS_FILE):
         self.path = path
         self.errors = []
+        self.added = []  # 기존 설정 파일에 자동 추가된 항목
 
         if not os.path.exists(path):
             try:
@@ -129,6 +184,11 @@ class Settings:
                     f.write(DEFAULT_SETTINGS.replace("\n", "\r\n"))
             except OSError as e:
                 self.errors.append(f"기본 설정 파일 생성 실패: {e}")
+        else:
+            try:
+                self.added = add_missing_settings(path)
+            except Exception as e:
+                self.errors.append(f"설정 파일에 새 항목 추가 실패: {e}")
 
         cp = configparser.ConfigParser(interpolation=None)
         cp.read_string(DEFAULT_SETTINGS)  # 기본값
