@@ -50,6 +50,16 @@ mode = csv
 ;   60 = 1분마다 저장  (장비 1대당 하루  1,440행)
 save_interval_sec = 30
 
+; 값이 바뀌었을 때만 저장 (true / false)
+;   true  : 저장 시점에 카운트 값이 직전 저장값과 같으면 저장하지 않음 (장비가 멈춰 있으면 행이 쌓이지 않음)
+;   false : 값 변화와 상관없이 저장 주기마다 항상 저장
+save_only_on_change = true
+
+; [save_only_on_change = true 일 때] 값이 그대로여도 이 시간(분)마다 1건은 저장
+; → 서버에서 "장비가 멈춘 것"과 "PC/프로그램이 꺼진 것"을 구분하는 생존 신호 역할
+; 0 이면 사용 안 함
+keepalive_minutes = 60
+
 
 [csv]
 ; CSV 저장 폴더. 비워 두면 프로그램(exe)이 있는 폴더에 저장합니다.
@@ -132,7 +142,10 @@ class Settings:
         self.station = g.get("station", "").strip() or socket.gethostname()
         self.poll_interval_ms = self._get_int(g, "poll_interval_ms", 1000, minimum=200)
 
-        self.save_interval_sec = self._get_int(cp["storage"], "save_interval_sec", 30, minimum=1)
+        st = cp["storage"]
+        self.save_interval_sec = self._get_int(st, "save_interval_sec", 30, minimum=1)
+        self.save_only_on_change = st.get("save_only_on_change", "true").strip().lower() in ("1", "true", "yes", "on")
+        self.keepalive_minutes = self._get_int(st, "keepalive_minutes", 60, minimum=0)
         self.mode = cp["storage"].get("mode", "csv").strip().lower()
         if self.mode not in STORAGE_MODES:
             self.errors.append(f"[storage] mode 값 '{self.mode}' 이(가) 올바르지 않아 csv 로 저장합니다.")

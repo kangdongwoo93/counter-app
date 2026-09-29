@@ -251,9 +251,16 @@
     save_interval_sec 저장 주기(초). 화면 갱신과 별개로 장비마다 이 주기에 1건씩 저장 (기본 30)
                      매 분 0초/30초처럼 시각에 맞춰 저장되며,
                      연결 시작 / 연결 끊기 / 프로그램 종료 시점의 값도 저장됩니다.
-                       1  → 장비 1대당 하루 86,400행
-                       30 → 장비 1대당 하루  2,880행
-                       60 → 장비 1대당 하루  1,440행
+                       1  → 장비 1대당 하루 최대 86,400행
+                       30 → 장비 1대당 하루 최대  2,880행
+                       60 → 장비 1대당 하루 최대  1,440행
+    save_only_on_change true 면 저장 시점의 값이 직전 저장값과 같을 때 저장하지 않음 (기본 true)
+                     → 장비가 켜져 있어도 멈춰 있으면 같은 값이 쌓이지 않음
+                     → 값이 늘거나, 리셋으로 줄어들면 저장
+                     false 면 값 변화와 관계없이 저장 주기마다 항상 저장
+    keepalive_minutes save_only_on_change = true 일 때, 값이 그대로여도 이 시간(분)마다 1건 저장
+                     (기본 60, 0 이면 사용 안 함)
+                     → 서버에서 "장비가 멈춘 것"과 "PC/프로그램이 꺼진 것"을 구분하는 생존 신호
 
   [csv]
     folder           CSV 저장 폴더. 비우면 exe 폴더.
@@ -352,9 +359,28 @@
       FROM counter_log
       GROUP BY DATE(logged_at), station, device_name;
 
-  ※ 저장 행 수 = 장비 수 × (86,400 ÷ save_interval_sec) / 하루
-     예) 30초 저장, 장비 10대 → 하루 28,800행, 1년 약 1,050만 행
+  ※ 저장 행 수 (장비 1대당 하루)
+     - save_only_on_change = false : 86,400 ÷ save_interval_sec  (30초 → 2,880행)
+     - save_only_on_change = true  : 가동 시간에만 쌓임 + 정지 중에는 keepalive 1시간당 1건
+       예) 30초 저장, 하루 8시간 가동 → 약 960 + 16 = 976행
      데이터가 많으면 save_interval_sec 를 늘리거나, 오래된 데이터를 주기적으로 정리하세요.
+
+  ※ save_only_on_change = true 일 때 조회 방법
+     값이 바뀔 때만 행이 생기므로, "특정 시각의 카운트"는
+     그 시각 이전의 가장 마지막 행 값입니다. (그 사이 값은 변하지 않았다는 뜻)
+
+      MySQL 예) 2026-10-01 12:00 시점의 장비별 카운트
+      SELECT t.station, t.device_name, t.count_value, t.logged_at
+      FROM counter_log t
+      JOIN (SELECT station, device_name, MAX(logged_at) AS last_at
+            FROM counter_log
+            WHERE logged_at <= '2026-10-01 12:00:00'
+            GROUP BY station, device_name) m
+        ON t.station = m.station AND t.device_name = m.device_name
+       AND t.logged_at = m.last_at;
+
+     마지막 행 시각이 keepalive_minutes 보다 오래되었다면
+     그 PC 의 프로그램이 꺼져 있거나 DB 연결이 끊긴 상태로 볼 수 있습니다.
 
   ---------------------------------------------------------
   6-4. DB 연결이 끊겼을 때
@@ -375,7 +401,8 @@
 --------------------------------------------------------------------------------
   - 통신 설정: 9600 bps, Even, Data 8, Stop 1, Slave ID 1 (CT6Y 기본값)
   - 1초마다(poll_interval_ms) Holding Register 0~1 (32비트 카운트 값)을 읽어 화면에 표시
-  - 저장은 30초마다(save_interval_sec) 장비별 1건씩 CSV / DB 에 기록 (6장)
+  - 저장은 30초 단위(save_interval_sec)로, 값이 바뀌었을 때만 CSV / DB 에 기록
+    (정지 중에는 1시간마다 생존 신호 1건. 연결 시작/끊기/종료 시점 값도 기록) (6장)
   - [0 리셋]: Coil 1 에 ON 을 보내 카운터를 0 으로 초기화 (연결 중에만 가능)
   - 설정 파일과 CSV 는 항상 exe 가 있는 폴더에 저장됩니다. (CSV 폴더는 변경 가능)
     (자동 실행 시 작업 폴더가 달라도 동일)

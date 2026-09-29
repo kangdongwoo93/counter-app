@@ -39,11 +39,14 @@ _UNIT_KW = ("device_id" if "device_id" in inspect.signature(ModbusSerialClient.r
 SLAVE_ID = 1
 POLL_INTERVAL_MS = 1000  # 데이터 읽기(화면 갱신) 주기 (settings.ini 의 poll_interval_ms 로 변경)
 SAVE_INTERVAL_SEC = 30   # 저장 주기 (settings.ini 의 save_interval_sec 로 변경)
+SAVE_ONLY_ON_CHANGE = True  # 값이 바뀌었을 때만 저장 (save_only_on_change)
+KEEPALIVE_SEC = 3600     # 값이 그대로여도 이 간격마다 1건 저장, 0 = 사용 안 함 (keepalive_minutes)
 
 
 def collecting_text(port):
-    return (f"{port} 연결됨 · {POLL_INTERVAL_MS / 1000:g}초 주기로 수집 중 · "
-            f"{SAVE_INTERVAL_SEC}초마다 저장")
+    save = (f"{SAVE_INTERVAL_SEC}초 단위로 변화 시 저장" if SAVE_ONLY_ON_CHANGE
+            else f"{SAVE_INTERVAL_SEC}초마다 저장")
+    return f"{port} 연결됨 · {POLL_INTERVAL_MS / 1000:g}초 주기로 수집 중 · {save}"
 
 CARD_MIN_WIDTH = 360
 
@@ -308,8 +311,9 @@ class CounterCard(QFrame):
         self.connecting = False  # 연결 시도 중 여부
         self.want_connect = False  # 사용자가 연결을 원하는 상태인지 (다음 실행 시 자동 연결 여부)
         self.port = None
-        self.save_slot = None    # 마지막으로 저장한 저장 주기 구간 번호
-        self.unsaved = None      # 아직 저장하지 않은 최신 값 (값, 시각)
+        self.save_slot = None    # 마지막으로 확인한 저장 주기 구간 번호
+        self.last_saved = None   # 마지막으로 저장한 (값, 시각)
+        self.last_read = None    # 마지막으로 읽은 (값, 시각)
 
         self.initUI(default_name, default_port)
         self.init_worker()
@@ -526,7 +530,10 @@ class CounterCard(QFrame):
             return False
 
         self.port = port
-        self.save_slot = None  # 연결 후 첫 값은 바로 저장
+        # 연결 후 첫 값은 바로 저장
+        self.save_slot = None
+        self.last_saved = None
+        self.last_read = None
         self.want_connect = True
         self.connecting = True
         self.set_state("connecting", f"{port} 연결 시도 중...")
@@ -534,7 +541,7 @@ class CounterCard(QFrame):
         return True
 
     def stop_connection(self):
-        self.flush_unsaved()
+        self.save_last_read()
         was_active = self.running or self.connecting
         self.want_connect = False
         self.running = False
@@ -565,25 +572,36 @@ class CounterCard(QFrame):
         now = datetime.now()
         self.lbl_count.setText(f"{count_value:,}")
         self.lbl_updated.setText(f"마지막 수신: {now.strftime('%H:%M:%S')}")
-        # 저장 주기 구간(예: 30초 → 매 분 0초~29초, 30초~59초)마다 1건 저장.
-        # 실제 저장(CSV / DB)은 저장 스레드에서 처리
+        # 저장 주기 구간(예: 30초 → 매 분 0초~29초, 30초~59초)이 바뀔 때 저장 여부 판단
+        self.last_read = (count_value, now)
         slot = int(now.timestamp()) // SAVE_INTERVAL_SEC
         if slot != self.save_slot:
             self.save_slot = slot
-            self.unsaved = None
-            self.parent_app.storage.put(self.txt_name.text().strip(), self.port, count_value, now)
-        else:
-            self.unsaved = (count_value, now)
+            if self.should_save(count_value, now):
+                self.save_record(count_value, now)
         if self.state != "connected":
             self.set_state("connected")
         self.lbl_status.setText(collecting_text(self.port))
 
-    def flush_unsaved(self):
-        """연결 해제·종료 시 아직 저장하지 않은 마지막 값을 저장"""
-        if self.unsaved and self.port:
-            count_value, ts = self.unsaved
-            self.parent_app.storage.put(self.txt_name.text().strip(), self.port, count_value, ts)
-        self.unsaved = None
+    def should_save(self, count_value, now):
+        if not SAVE_ONLY_ON_CHANGE or self.last_saved is None:
+            return True
+        last_value, last_ts = self.last_saved
+        if count_value != last_value:  # 증가 또는 리셋으로 감소
+            return True
+        # 값이 그대로여도 일정 시간마다 1건 저장 (생존 신호)
+        return KEEPALIVE_SEC > 0 and (now - last_ts).total_seconds() >= KEEPALIVE_SEC
+
+    def save_record(self, count_value, ts):
+        # 실제 저장(CSV / DB)은 저장 스레드에서 처리
+        self.parent_app.storage.put(self.txt_name.text().strip(), self.port, count_value, ts)
+        self.last_saved = (count_value, ts)
+
+    def save_last_read(self):
+        """연결 해제·종료 시 마지막으로 읽은 값을 저장 (수집 종료 시점 기록)"""
+        if self.last_read and self.port and (self.last_saved is None or self.last_read[1] > self.last_saved[1]):
+            self.save_record(*self.last_read)
+        self.last_read = None
 
     @pyqtSlot(str)
     def on_read_failed(self, message):
@@ -630,10 +648,12 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        global POLL_INTERVAL_MS, SAVE_INTERVAL_SEC
+        global POLL_INTERVAL_MS, SAVE_INTERVAL_SEC, SAVE_ONLY_ON_CHANGE, KEEPALIVE_SEC
         self.settings = Settings()
         POLL_INTERVAL_MS = self.settings.poll_interval_ms
         SAVE_INTERVAL_SEC = self.settings.save_interval_sec
+        SAVE_ONLY_ON_CHANGE = self.settings.save_only_on_change
+        KEEPALIVE_SEC = self.settings.keepalive_minutes * 60
         self.storage = StorageWriter(self.settings, on_status=self.storage_status.emit)
 
         self.cards = []
@@ -859,7 +879,7 @@ class MainWindow(QMainWindow):
         self.clock_timer.stop()
         # 모든 스레드에 종료를 먼저 요청한 뒤 한꺼번에 대기 (종료 시간 단축)
         for card in self.cards:
-            card.flush_unsaved()
+            card.save_last_read()
             card.shutdown()
         # 삭제된 카드의 정리 중인 스레드까지 포함해 모든 통신 스레드 종료 대기
         for thread in self.findChildren(QThread):
