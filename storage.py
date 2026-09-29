@@ -32,7 +32,7 @@ DEFAULT_SETTINGS = """\
 ; 비워 두면 컴퓨터 이름을 사용합니다.
 station =
 
-; 카운터 값 읽기 주기 (밀리초, 1000 = 1초)
+; 카운터 값 읽기 주기 (밀리초, 1000 = 1초) - 화면 숫자가 이 주기로 갱신됩니다.
 poll_interval_ms = 1000
 
 
@@ -42,6 +42,13 @@ poll_interval_ms = 1000
 ;   db   : 데이터베이스로만 저장
 ;   both : CSV 와 데이터베이스 모두 저장
 mode = csv
+
+; 저장 주기 (초). 화면 갱신 주기와 별개로, 장비마다 이 주기에 1건씩 저장합니다.
+; 매 분 0초/30초처럼 시각에 맞춰 저장되며, 연결 시작·연결 해제·프로그램 종료 시점의 값도 저장합니다.
+;   1  = 매초 저장    (장비 1대당 하루 86,400행)
+;   30 = 30초마다 저장 (장비 1대당 하루  2,880행)
+;   60 = 1분마다 저장  (장비 1대당 하루  1,440행)
+save_interval_sec = 30
 
 
 [csv]
@@ -125,6 +132,7 @@ class Settings:
         self.station = g.get("station", "").strip() or socket.gethostname()
         self.poll_interval_ms = self._get_int(g, "poll_interval_ms", 1000, minimum=200)
 
+        self.save_interval_sec = self._get_int(cp["storage"], "save_interval_sec", 30, minimum=1)
         self.mode = cp["storage"].get("mode", "csv").strip().lower()
         if self.mode not in STORAGE_MODES:
             self.errors.append(f"[storage] mode 값 '{self.mode}' 이(가) 올바르지 않아 csv 로 저장합니다.")
