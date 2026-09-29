@@ -13,6 +13,13 @@ from PyQt5.QtGui import QFont, QColor
 import serial.tools.list_ports
 from pymodbus.client import ModbusSerialClient
 
+# 실행 파일(exe)이 있는 폴더. 설정 파일과 CSV 로그를 이 폴더에 저장한다.
+# (부팅 시 자동 실행되면 작업 폴더가 C:\Windows\System32 등으로 달라질 수 있으므로 고정)
+if getattr(sys, "frozen", False):
+    APP_DIR = os.path.dirname(sys.executable)
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
 CONFIG_FILE = "counter_config.json"
 
 # ==============================================================================
@@ -292,6 +299,7 @@ class CounterCard(QFrame):
         self.state = "idle"
         self.running = False     # 연결되어 수집 중인지 여부
         self.connecting = False  # 연결 시도 중 여부
+        self.want_connect = False  # 사용자가 연결을 원하는 상태인지 (다음 실행 시 자동 연결 여부)
         self.port = None
 
         self.initUI(default_name, default_port)
@@ -509,6 +517,7 @@ class CounterCard(QFrame):
             return False
 
         self.port = port
+        self.want_connect = True
         self.connecting = True
         self.set_state("connecting", f"{port} 연결 시도 중...")
         self.request_open.emit(port)
@@ -516,11 +525,14 @@ class CounterCard(QFrame):
 
     def stop_connection(self):
         was_active = self.running or self.connecting
+        self.want_connect = False
         self.running = False
         self.connecting = False
         if was_active:
             self.request_close.emit()
         self.set_state("idle", "연결 해제됨")
+        if was_active:
+            self.parent_app.save_config()
 
     @pyqtSlot(bool, str)
     def on_connect_result(self, ok, port):
@@ -531,6 +543,7 @@ class CounterCard(QFrame):
         if ok:
             self.running = True
             self.set_state("connected", f"{port} 연결됨 · 1초 주기로 수집 중")
+            self.parent_app.save_config()
         else:
             self.set_state("error", f"{port} 연결 실패 — 케이블/포트 사용 여부를 확인하세요.")
 
@@ -595,7 +608,7 @@ class CounterCard(QFrame):
         return {
             "name": self.txt_name.text(),
             "port": self.port_combo.currentData(),
-            "auto_connect": self.running or self.connecting
+            "auto_connect": self.want_connect
         }
 
 
@@ -604,6 +617,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.cards = []
         self.next_card_id = 1
+        self.loading = True  # 설정 불러오는 중에는 중간 저장 금지
         self.columns = 2
         self.initUI()
         self.load_config_and_autoconnect()
@@ -706,6 +720,7 @@ class MainWindow(QMainWindow):
         self.next_card_id += 1
         self.rearrange_grid()
         self.update_summary()
+        self.save_config()
 
         # 이전 상태가 연결 중이었다면 자동 연결 수행
         if auto_connect:
@@ -719,6 +734,7 @@ class MainWindow(QMainWindow):
         card.deleteLater()
         self.rearrange_grid()
         self.update_summary()
+        self.save_config()
 
     def rearrange_grid(self):
         for card in self.cards:
@@ -751,12 +767,20 @@ class MainWindow(QMainWindow):
         self.show_message("COM 포트 목록을 새로고침했습니다.")
 
     def save_config(self):
+        # 카드 추가/삭제, 연결/해제 시마다 저장 → 강제 종료·정전 후 재부팅해도 마지막 상태로 복구
+        if self.loading:
+            return
         config_data = []
         for card in self.cards:
             config_data.append(card.get_config())
 
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(config_data, f, ensure_ascii=False, indent=4)
+        try:
+            tmp_file = CONFIG_FILE + ".tmp"
+            with open(tmp_file, 'w', encoding='utf-8') as f:
+                json.dump(config_data, f, ensure_ascii=False, indent=4)
+            os.replace(tmp_file, CONFIG_FILE)
+        except OSError as e:
+            self.show_message(f"설정 저장 실패: {e}")
 
     def load_config_and_autoconnect(self):
         if os.path.exists(CONFIG_FILE):
@@ -773,6 +797,7 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 print(f"설정 로드 오류: {e}")
 
+        self.loading = False
         if not self.cards:
             self.add_counter_card()
 
@@ -791,6 +816,7 @@ if __name__ == "__main__":
     if hasattr(Qt, "AA_EnableHighDpiScaling"):
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
         QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    os.chdir(APP_DIR)
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setFont(QFont("맑은 고딕", 10))
