@@ -23,15 +23,26 @@ else:
 
 CONFIG_FILE = "counter_config.json"
 
-# ==============================================================================
-# 1. SCM-US48I 시리얼 번호와 기계 이름 매핑 테이블
-# (실제 보유하신 SCM-US48I의 시리얼 번호로 수정해서 사용하시면 됩니다)
-# ==============================================================================
-DEVICE_MAP = {
-    "FT9X123A": "1번 라인 카운터",
-    "FT9X123B": "2번 라인 카운터",
-    "FT9X123C": "3번 라인 카운터"
-}
+# USB-시리얼 변환기(SCM-US48I) 시리얼 번호 → 장비 이름 표시는 settings.ini [devices] 에서 설정
+
+RETRY_SEC = 10          # 자동 연결 실패 시 재시도 간격 (초)
+READ_FAIL_LIMIT = 5     # 연속 읽기 실패가 이 횟수에 도달하면 포트를 다시 열어 재연결
+
+
+def scan_ports():
+    """현재 PC 의 COM 포트 목록 [(포트, 설명, USB 시리얼 번호)]"""
+    return [(p.device, p.description, p.serial_number or "") for p in serial.tools.list_ports.comports()]
+
+
+def serial_of(port):
+    return next((sn for dev, _, sn in scan_ports() if dev == port), "")
+
+
+def find_port_by_serial(serial_no):
+    """USB 시리얼 번호로 현재 COM 포트 찾기 (COM 번호가 바뀌어도 같은 변환기를 찾음)"""
+    if not serial_no:
+        return None
+    return next((dev for dev, _, sn in scan_ports() if sn and sn.upper() == serial_no.upper()), None)
 
 # pymodbus 3.10 이상은 'slave' 대신 'device_id' 인자를 사용
 _UNIT_KW = ("device_id" if "device_id" in inspect.signature(ModbusSerialClient.read_holding_registers).parameters
@@ -312,7 +323,7 @@ class CounterCard(QFrame):
     request_close = pyqtSignal()
     request_stop = pyqtSignal()
 
-    def __init__(self, card_id, parent_app, default_name="", default_port=""):
+    def __init__(self, card_id, parent_app, default_name="", default_port="", serial_no=""):
         super().__init__()
         self.setObjectName("Card")
         self.card_id = card_id
@@ -325,8 +336,19 @@ class CounterCard(QFrame):
         self.save_slot = None    # 마지막으로 확인한 저장 주기 구간 번호
         self.last_saved = None   # 마지막으로 저장한 (값, 시각)
         self.last_read = None    # 마지막으로 읽은 (값, 시각)
+        self.serial = serial_no or ""  # 마지막으로 연결에 성공한 USB 변환기 시리얼 번호
+        self.auto_retry = False  # 연결 실패/끊김 시 자동 재연결 여부 (자동 연결이거나 한 번 연결에 성공한 경우)
+        self.read_fails = 0      # 연속 읽기 실패 횟수
+        self.retry_timer = QTimer(self)
+        self.retry_timer.setSingleShot(True)
+        self.retry_timer.timeout.connect(self.retry_connect)
 
-        self.initUI(default_name, default_port)
+        # 저장된 시리얼 번호의 변환기가 다른 COM 번호로 잡혀 있으면 그 포트를 선택
+        found = find_port_by_serial(self.serial)
+        if found and default_port and found != default_port:
+            QTimer.singleShot(0, lambda: self.parent_app.show_message(
+                f"[{self.txt_name.text()}] COM 번호 변경 감지: {default_port} → {found} (S/N {self.serial})", 15000))
+        self.initUI(default_name, found or default_port)
         self.init_worker()
 
     def init_worker(self):
@@ -353,6 +375,7 @@ class CounterCard(QFrame):
         """통신 스레드 종료 요청 (진행 중인 통신이 끝나면 포트를 닫고 스스로 종료)"""
         self.running = False
         self.connecting = False
+        self.retry_timer.stop()
         self.request_stop.emit()
 
     def initUI(self, default_name, default_port):
@@ -402,19 +425,13 @@ class CounterCard(QFrame):
 
         self.port_combo = QComboBox()
         self.port_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.refresh_ports()
-
-        # 이전 저장 포트 선택
-        if default_port:
-            index = self.port_combo.findData(default_port)
-            if index >= 0:
-                self.port_combo.setCurrentIndex(index)
+        self.refresh_ports(prefer=default_port)  # 이전 저장 포트 선택
 
         self.btn_refresh = QPushButton("⟳")
         self.btn_refresh.setObjectName("Icon")
         self.btn_refresh.setToolTip("포트 목록 새로고침")
         self.btn_refresh.setCursor(Qt.PointingHandCursor)
-        self.btn_refresh.clicked.connect(self.refresh_ports)
+        self.btn_refresh.clicked.connect(lambda: self.refresh_ports())
 
         port_row.addWidget(lbl_port)
         port_row.addWidget(self.port_combo, 1)
@@ -477,77 +494,86 @@ class CounterCard(QFrame):
             self.lbl_status.setText(message)
 
         running = self.running
-        locked = running or self.connecting
+        active = running or self.retry_timer.isActive()  # 수집 중 또는 재연결 대기 중
+        locked = active or self.connecting
         self.btn_reset.setEnabled(running)
         self.btn_connect.setEnabled(not self.connecting)
         self.port_combo.setEnabled(not locked)
         self.btn_refresh.setEnabled(not locked)
         self.txt_name.setEnabled(not locked)
-        self.btn_connect.setText("■  연결 끊기" if running else "▶  연결 시작")
-        self.btn_connect.setProperty("connected", "true" if running else "false")
+        self.btn_connect.setText("■  연결 끊기" if active else "▶  연결 시작")
+        self.btn_connect.setProperty("connected", "true" if active else "false")
         repolish(self.btn_connect)
 
         self.parent_app.update_summary()
 
-    def refresh_ports(self):
-        """COM 포트 검색 및 DEVICE_MAP 기반 이름 자동 매핑"""
-        current_data = self.port_combo.currentData()
+    def refresh_ports(self, prefer=None):
+        """COM 포트 검색. settings.ini [devices] 에 등록된 시리얼 번호는 장비 이름으로 표시"""
+        target = prefer if prefer else self.port_combo.currentData()
         self.port_combo.clear()
-        ports = serial.tools.list_ports.comports()
+        devices = self.parent_app.settings.devices
 
-        for p in ports:
-            sn = p.serial_number  # USB 고유 시리얼 번호
-            matched_name = None
+        for dev, desc, sn in scan_ports():
+            # [devices] 에 등록된 시리얼 번호인지 검사
+            matched_name = next((name for key, name in devices.items() if sn and key in sn.upper()), None)
+            display_text = f"[{matched_name}] {dev}" if matched_name else f"{dev} ({desc})"
+            if self.serial and sn and sn.upper() == self.serial.upper():
+                display_text += "  ★"  # 이 카드가 기억하는 변환기
 
-            # DEVICE_MAP에 등록된 시리얼 번호인지 검사
-            if sn:
-                for target_sn, dev_name in DEVICE_MAP.items():
-                    if target_sn in sn:
-                        matched_name = dev_name
-                        break
-
-            # 표시 텍스트 생성
-            if matched_name:
-                display_text = f"[{matched_name}] {p.device}"
-            else:
-                display_text = f"{p.device} ({p.description})"
-
-            self.port_combo.addItem(display_text, p.device)
+            self.port_combo.addItem(display_text, dev)
             self.port_combo.setItemData(self.port_combo.count() - 1,
-                                        f"{p.device}\n{p.description}\nS/N: {sn or '-'}", Qt.ToolTipRole)
+                                        f"{dev}\n{desc}\nS/N: {sn or '-'}", Qt.ToolTipRole)
 
             # 시리얼 번호로 감지된 이름이 있다면 장비 이름 입력창에 자동 반영 (초기값 설정용)
             if matched_name and not self.txt_name.text().strip():
                 self.txt_name.setText(matched_name)
 
+        # 저장된 포트가 지금 없으면 (USB 미연결 등) 목록에 표시만 해 두고 선택 유지
+        if target and self.port_combo.findData(target) < 0:
+            self.port_combo.addItem(f"{target} (현재 연결 안 됨)", target)
+
         if self.port_combo.count() == 0:
             self.port_combo.addItem("감지된 COM 포트 없음", None)
 
-        if current_data:
-            index = self.port_combo.findData(current_data)
-            if index >= 0:
-                self.port_combo.setCurrentIndex(index)
+        if target:
+            self.port_combo.setCurrentIndex(self.port_combo.findData(target))
 
     def toggle_connection(self):
-        if self.running:
+        if self.running or self.retry_timer.isActive():
             self.stop_connection()
         elif not self.connecting:
             self.start_connection()
 
-    def start_connection(self):
+    def start_connection(self, auto=False):
+        """auto=True: 프로그램 시작 시 자동 연결 / 자동 재연결.
+        이때는 기억해 둔 시리얼 번호로 COM 포트를 다시 찾고, 실패하면 RETRY_SEC 후 재시도한다."""
+        self.retry_timer.stop()
+        if auto:
+            self.want_connect = True
+            found = find_port_by_serial(self.serial)
+            current = self.port_combo.currentData()
+            if found and found != current:
+                self.refresh_ports(prefer=found)
+                self.parent_app.show_message(
+                    f"[{self.txt_name.text()}] COM 번호 변경 감지: {current} → {found} (S/N {self.serial})", 15000)
+            else:
+                self.refresh_ports(prefer=current)
+        self.auto_retry = auto
+
         port = self.port_combo.currentData()
         if not port:
-            self.set_state("error", "COM 포트를 선택해 주세요.")
+            self.fail_or_retry("COM 포트를 선택해 주세요.")
             return False
         # 하나의 COM 포트는 한 카드만 사용할 수 있음
         other = next((c for c in self.parent_app.cards
                       if c is not self and c.port == port and (c.running or c.connecting)), None)
         if other:
-            self.set_state("error", f"{port} 는 #{other.card_id} [{other.txt_name.text()}] 카드가 사용 중입니다. "
-                                    f"다른 COM 포트를 선택하세요.")
+            self.fail_or_retry(f"{port} 는 #{other.card_id} [{other.txt_name.text()}] 카드가 사용 중입니다. "
+                               f"다른 COM 포트를 선택하세요.")
             return False
 
         self.port = port
+        self.read_fails = 0
         # 연결 후 첫 값은 바로 저장
         self.save_slot = None
         self.last_saved = None
@@ -558,9 +584,22 @@ class CounterCard(QFrame):
         self.request_open.emit(port)
         return True
 
+    def fail_or_retry(self, message):
+        """연결 실패 표시. 자동 재연결 대상이면 RETRY_SEC 후 다시 시도"""
+        if self.auto_retry and self.want_connect:
+            self.retry_timer.start(RETRY_SEC * 1000)
+            message += f"  ({RETRY_SEC}초 후 다시 시도)"
+        self.set_state("error", message)
+
+    def retry_connect(self):
+        if self.want_connect and not (self.running or self.connecting):
+            self.start_connection(auto=True)
+
     def stop_connection(self):
         self.save_last_read()
-        was_active = self.running or self.connecting
+        was_active = self.running or self.connecting or self.retry_timer.isActive()
+        self.retry_timer.stop()
+        self.auto_retry = False
         self.want_connect = False
         self.running = False
         self.connecting = False
@@ -578,16 +617,20 @@ class CounterCard(QFrame):
         self.connecting = False
         if ok:
             self.running = True
+            self.auto_retry = True  # 한 번 연결에 성공하면 이후 끊겨도 자동 재연결
+            self.serial = serial_of(port) or self.serial  # 이 카드의 변환기 기억
+            self.refresh_ports(prefer=port)
             self.set_state("connected", collecting_text(port))
             self.parent_app.save_config()
         else:
-            self.set_state("error", f"{port} 연결 실패 — 케이블/포트 사용 여부를 확인하세요.")
+            self.fail_or_retry(f"{port} 연결 실패 — 케이블/포트 사용 여부를 확인하세요.")
 
     @pyqtSlot(object)
     def on_count_read(self, count_value):
         if not self.running:
             return  # 연결 해제 직후 도착한 이전 결과 무시
         now = datetime.now()
+        self.read_fails = 0
         self.lbl_count.setText(f"{count_value:,}")
         self.lbl_updated.setText(f"마지막 수신: {now.strftime('%H:%M:%S')}")
         # 저장 주기 구간(예: 30초 → 매 분 0초~29초, 30초~59초)이 바뀔 때 저장 여부 판단
@@ -625,6 +668,16 @@ class CounterCard(QFrame):
     def on_read_failed(self, message):
         if not self.running:
             return
+        self.read_fails += 1
+        if self.read_fails >= READ_FAIL_LIMIT and self.auto_retry:
+            # USB 분리 등으로 계속 실패하면 포트를 닫고 다시 연결 (COM 번호가 바뀌었으면 시리얼 번호로 찾음)
+            self.save_last_read()
+            self.running = False
+            self.read_fails = 0
+            self.request_close.emit()
+            self.retry_timer.start(3000)
+            self.set_state("error", f"응답 없음 {READ_FAIL_LIMIT}회 — 포트를 다시 열어 재연결합니다.")
+            return
         self.set_state("warning", message)
 
     def reset_counter(self):
@@ -656,6 +709,7 @@ class CounterCard(QFrame):
         return {
             "name": self.txt_name.text(),
             "port": self.port_combo.currentData(),
+            "serial": self.serial,
             "auto_connect": self.want_connect
         }
 
@@ -772,7 +826,7 @@ class MainWindow(QMainWindow):
         if self.settings.errors:
             self.on_storage_status("설정 오류: " + " / ".join(self.settings.errors), "error")
         if self.settings.added:
-            names = ", ".join(k.split(".", 1)[1] for k in self.settings.added)
+            names = ", ".join(self.settings.added)
             QTimer.singleShot(0, lambda: self.show_message(
                 f"{SETTINGS_FILE} 에 새 설정 항목을 추가했습니다 (기본값): {names}", 20000))
 
@@ -809,8 +863,8 @@ class MainWindow(QMainWindow):
     def show_message(self, text, timeout=5000):
         self.statusBar().showMessage(text, timeout)
 
-    def add_counter_card(self, name="", port="", auto_connect=False):
-        card = CounterCard(self.next_card_id, self, default_name=name, default_port=port)
+    def add_counter_card(self, name="", port="", auto_connect=False, serial_no=""):
+        card = CounterCard(self.next_card_id, self, default_name=name, default_port=port, serial_no=serial_no)
         self.cards.append(card)
         self.next_card_id += 1
         self.rearrange_grid()
@@ -819,7 +873,7 @@ class MainWindow(QMainWindow):
 
         # 이전 상태가 연결 중이었다면 자동 연결 수행
         if auto_connect:
-            card.start_connection()
+            card.start_connection(auto=True)
 
     def remove_counter_card(self, card):
         card.stop_connection()
@@ -887,7 +941,8 @@ class MainWindow(QMainWindow):
                     self.add_counter_card(
                         name=item.get("name", ""),
                         port=item.get("port", ""),
-                        auto_connect=item.get("auto_connect", False)
+                        auto_connect=item.get("auto_connect", False),
+                        serial_no=item.get("serial", "")
                     )
             except Exception as e:
                 print(f"설정 로드 오류: {e}")

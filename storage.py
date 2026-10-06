@@ -64,6 +64,16 @@ word_order = low_first
 reset_coil_address = 1
 
 
+[devices]
+; USB-시리얼 변환기 시리얼 번호 = 표시할 장비 이름
+;   포트 목록에 "[장비 이름] COM3" 형태로 표시되어 어느 포트가 어느 장비인지 구분할 수 있습니다.
+;   시리얼 번호는 "python USB_serial_check.py" 로 확인합니다.
+;   (카드가 기억하는 변환기는 연결 성공 시 자동 저장되므로, 여기 등록은 표시용입니다)
+; 예)
+; B001T4P1A = A라인 카운터
+; B001T4P2B = B라인 카운터
+
+
 [storage]
 ; 저장 방식
 ;   csv  : CSV 파일로만 저장 (기본값)
@@ -164,6 +174,22 @@ def _default_blocks():
     return sections
 
 
+def _default_section_lines(section):
+    """DEFAULT_SETTINGS 에서 [section] 헤더부터 다음 섹션 전까지의 줄 (뒤쪽 빈 줄 제외)"""
+    out, inside = [], False
+    for line in DEFAULT_SETTINGS.splitlines():
+        text = line.strip()
+        if text.startswith("[") and text.endswith("]"):
+            if inside:
+                break
+            inside = text[1:-1] == section
+        if inside:
+            out.append(line)
+    while out and not out[-1].strip():
+        out.pop()
+    return out
+
+
 def add_missing_settings(path):
     """기존 settings.ini 에 없는 (새 버전에서 추가된) 항목을 기본값과 설명과 함께 추가.
     사용자가 수정한 기존 값은 그대로 유지한다. 추가된 항목 이름 목록을 반환."""
@@ -174,18 +200,21 @@ def add_missing_settings(path):
     added = []
 
     for section, blocks in _default_blocks().items():
-        missing = [(k, b) for k, b in blocks if not (cp.has_section(section) and cp.has_option(section, k))]
+        header = next((i for i, l in enumerate(lines) if l.strip().lower() == f"[{section}]"), None)
+        if header is None:
+            # 섹션 전체가 없으면 설명 주석까지 통째로 추가
+            lines += ["", "", "; ↓ 새 버전에서 추가된 설정 (자동 추가됨)"] + _default_section_lines(section)
+            added.append(f"[{section}]")
+            continue
+
+        missing = [(k, b) for k, b in blocks if not cp.has_option(section, k)]
         if not missing:
             continue
         insert = ["", "; ↓ 새 버전에서 추가된 설정 (자동 추가됨)"]
         for key, block in missing:
             insert += block + [""]
-            added.append(f"{section}.{key}")
+            added.append(key)
 
-        header = next((i for i, l in enumerate(lines) if l.strip().lower() == f"[{section}]"), None)
-        if header is None:
-            lines += ["", f"[{section}]"] + insert[1:]
-            continue
         # 해당 섹션의 끝(다음 섹션 시작 전, 뒤쪽 빈 줄 제외) 위치에 삽입
         end = next((i for i in range(header + 1, len(lines)) if lines[i].strip().startswith("[")), len(lines))
         while end > header + 1 and not lines[end - 1].strip():
@@ -229,6 +258,9 @@ class Settings:
         g = cp["general"]
         self.station = g.get("station", "").strip() or socket.gethostname()
         self.poll_interval_ms = self._get_int(g, "poll_interval_ms", 1000, minimum=200)
+
+        # [devices] 시리얼 번호(대문자) → 장비 이름
+        self.devices = {k.strip().upper(): v.strip() for k, v in cp["devices"].items() if k.strip() and v.strip()}
 
         m = cp["modbus"]
         self.mb_baudrate = self._get_int(m, "baudrate", 9600, minimum=1200)
