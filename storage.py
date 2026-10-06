@@ -36,6 +36,34 @@ station =
 poll_interval_ms = 1000
 
 
+[modbus]
+; 카운터 통신 설정 (오토닉스 CT 시리즈 기본값: 9600 bps, Even, Stop 1, 국번 1)
+baudrate = 9600
+; 패리티: E (Even) / O (Odd) / N (None)
+parity = E
+stopbits = 1
+; 카운터의 통신 국번 (Slave ID)
+slave_id = 1
+
+; 현재 카운트 값(PV)을 읽을 레지스터 (32비트 = 레지스터 2개)
+;   register_type : input   (기능코드 04, 3xxxxx 주소)
+;                   holding (기능코드 03, 4xxxxx 주소)
+;   pv_address    : 0 부터 시작하는 주소.  예) 301004 → 1003
+;   CT 시리즈 현재값: Input Register 301004 (pv_address = 1003, 16진수 03EB)
+;   ※ 장비 매뉴얼의 통신 주소표로 확인하세요. modbus_check.py 로 실제 값을 확인할 수 있습니다.
+register_type = input
+pv_address = 1003
+
+; 32비트 값의 워드 순서
+;   low_first  : 하위 워드가 먼저 (CT 시리즈)
+;   high_first : 상위 워드가 먼저
+word_order = low_first
+
+; [0 리셋] 버튼이 ON 을 보낼 Coil 주소 (0 부터 시작, 기능코드 05)
+; ※ 장비 매뉴얼의 리셋 주소와 같은지 확인한 뒤 사용하세요.
+reset_coil_address = 1
+
+
 [storage]
 ; 저장 방식
 ;   csv  : CSV 파일로만 저장 (기본값)
@@ -201,6 +229,25 @@ class Settings:
         g = cp["general"]
         self.station = g.get("station", "").strip() or socket.gethostname()
         self.poll_interval_ms = self._get_int(g, "poll_interval_ms", 1000, minimum=200)
+
+        m = cp["modbus"]
+        self.mb_baudrate = self._get_int(m, "baudrate", 9600, minimum=1200)
+        self.mb_parity = m.get("parity", "E").strip().upper()[:1] or "E"
+        if self.mb_parity not in ("E", "O", "N"):
+            self.errors.append(f"[modbus] parity 값 '{self.mb_parity}' 이(가) 올바르지 않아 E 를 사용합니다.")
+            self.mb_parity = "E"
+        self.mb_stopbits = 2 if self._get_int(m, "stopbits", 1) == 2 else 1
+        self.mb_slave_id = self._get_int(m, "slave_id", 1, minimum=0)
+        self.mb_register_type = m.get("register_type", "input").strip().lower()
+        if self.mb_register_type not in ("input", "holding"):
+            self.errors.append(f"[modbus] register_type 값 '{self.mb_register_type}' 이(가) 올바르지 않아 input 을 사용합니다.")
+            self.mb_register_type = "input"
+        self.mb_pv_address = self._get_int(m, "pv_address", 1003, minimum=0)
+        self.mb_word_order = m.get("word_order", "low_first").strip().lower()
+        if self.mb_word_order not in ("low_first", "high_first"):
+            self.errors.append(f"[modbus] word_order 값 '{self.mb_word_order}' 이(가) 올바르지 않아 low_first 를 사용합니다.")
+            self.mb_word_order = "low_first"
+        self.mb_reset_coil = self._get_int(m, "reset_coil_address", 1, minimum=0)
 
         st = cp["storage"]
         self.save_interval_sec = self._get_int(st, "save_interval_sec", 30, minimum=1)

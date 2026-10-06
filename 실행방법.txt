@@ -20,6 +20,7 @@
   storage.py              프로그램 소스 (환경설정 읽기 / CSV·DB 저장)
   counter_app.spec        PyInstaller 빌드 설정
   USB_serial_check.py     연결된 COM 포트 / USB 시리얼 번호 확인용 도구
+  modbus_check.py         카운터 레지스터 값 확인용 도구 (현재값 주소/워드 순서 확인) → 6-5
   dist\counter_app.exe    빌드된 실행 파일 (서버에는 이 파일만 복사하면 됨)
 
   프로그램 실행 후 exe와 같은 폴더에 자동 생성되는 파일
@@ -248,6 +249,17 @@
                      예) station = 1공장-A라인
     poll_interval_ms 값 읽기(=화면 갱신) 주기. 1000 = 1초
 
+  [modbus]  (카운터 통신 - CT 시리즈 기본값으로 설정되어 있음)
+    baudrate / parity / stopbits / slave_id
+                     통신 속도 / 패리티(E,O,N) / 정지 비트 / 국번. 카운터 통신 설정과 같아야 함
+                     기본: 9600 / E / 1 / 1
+    register_type    현재값(PV) 레지스터 종류: input(기능코드 04) / holding(기능코드 03)
+    pv_address       현재값 레지스터 주소 (0 부터). 매뉴얼 주소 301004 → 1003
+    word_order       32비트 값의 워드 순서: low_first (CT 시리즈) / high_first
+    reset_coil_address [0 리셋] 버튼이 ON 을 보낼 Coil 주소 (0 부터)
+    ※ 기본값: Input Register 1003 (301004), low_first
+       화면에 터무니없는 숫자(음수, 수십억 등)가 나오면 이 항목들을 6-5 로 확인하세요.
+
   [storage]
     mode             csv  : CSV 파일만 (기본값)
                      db   : DB 만
@@ -400,14 +412,37 @@
     오른쪽 끝에는 이 PC 의 station 이름이 표시됩니다.
 
 
+  ---------------------------------------------------------
+  6-5. 카운터 레지스터 확인 (modbus_check.py)
+  ---------------------------------------------------------
+  카운터 화면의 숫자와 프로그램 숫자가 다를 때, 실제 레지스터 값을 확인하는 도구입니다.
+  (Python 이 설치된 PC 에서 실행. counter_app 은 해당 포트 [연결 끊기] 후 실행)
+
+      python modbus_check.py              ← COM 포트 목록
+      python modbus_check.py COM3         ← COM3 카운터의 레지스터 값 표시
+
+  Input Register(1000~1011)와 Holding Register(0~11) 값을 읽고,
+  각 주소부터 2워드를 low_first / high_first 두 가지로 합친 값을 보여줍니다.
+  카운터 앞면에 표시된 현재 숫자와 같은 값을 찾아서
+    - 그 표의 종류      → register_type (Input = input, Holding = holding)
+    - 그 줄의 '주소'    → pv_address
+    - 같은 값이 있는 열 → word_order
+  로 settings.ini [modbus] 를 맞춘 뒤 프로그램을 다시 시작하세요.
+
+  예) Holding 0 의 high_first 값이 -1,147,142,131, low_first 값이 900,000 인 경우
+      → Holding 0~1 은 PS2 설정값(900,000)이고 워드 순서는 low_first.
+        현재값은 Input 1003 (301004) 에 있음.
+
+
 --------------------------------------------------------------------------------
 7. 동작 방식 참고
 --------------------------------------------------------------------------------
-  - 통신 설정: 9600 bps, Even, Data 8, Stop 1, Slave ID 1 (CT6Y 기본값)
-  - 1초마다(poll_interval_ms) Holding Register 0~1 (32비트 카운트 값)을 읽어 화면에 표시
+  - 통신 설정: 9600 bps, Even, Data 8, Stop 1, Slave ID 1 (CT 시리즈 기본값, settings.ini [modbus])
+  - 1초마다(poll_interval_ms) Input Register 301004~301005 (현재값, 32비트)를 읽어 화면에 표시
   - 저장은 30초 단위(save_interval_sec)로, 값이 바뀌었을 때만 CSV / DB 에 기록
     (정지 중에는 1시간마다 생존 신호 1건. 연결 시작/끊기/종료 시점 값도 기록) (6장)
-  - [0 리셋]: Coil 1 에 ON 을 보내 카운터를 0 으로 초기화 (연결 중에만 가능)
+  - [0 리셋]: Coil 1 (reset_coil_address) 에 ON 을 보내 카운터를 0 으로 초기화 (연결 중에만 가능)
+  - 하나의 COM 포트는 카드 하나만 사용할 수 있습니다.
   - 설정 파일과 CSV 는 항상 exe 가 있는 폴더에 저장됩니다. (CSV 폴더는 변경 가능)
     (자동 실행 시 작업 폴더가 달라도 동일)
   - 설정은 카드 추가/삭제, 연결/해제 할 때마다 즉시 저장됩니다.
@@ -426,6 +461,15 @@
 
   증상: "응답 오류" 배지 (연결은 됐지만 값이 안 들어옴)
     → 카운터의 통신 설정(9600/Even/8/1, 국번 1), RS485 배선(A/B) 확인
+    → settings.ini [modbus] 값이 카운터 설정과 같은지 확인
+
+  증상: 카운트가 음수나 수십억 같은 엉뚱한 숫자로 표시됨
+    → 레지스터 주소나 워드 순서가 맞지 않는 경우. 6-5 의 modbus_check.py 로 확인
+
+  증상: 장치 관리자에 "포트(COM & LPT)"가 없고 "기타 장치 > USB Serial Port" 에 ⚠ 표시
+    → USB-시리얼 변환기의 가상 COM 포트(VCP) 드라이버 미설치.
+      오토닉스 SCM-US48I 드라이버(또는 FTDI VCP 드라이버) 설치 후 USB 다시 연결.
+      그래도 없으면 장치 관리자 > USB Serial Converter > 속성 > 고급 > "Load VCP" 체크
 
   증상: 프로그램이 2개 실행됨 / 한쪽이 연결 실패
     → 방법 A 와 방법 B 를 동시에 설정했는지 확인하고 하나만 남김

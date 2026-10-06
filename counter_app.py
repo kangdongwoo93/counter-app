@@ -36,7 +36,6 @@ DEVICE_MAP = {
 # pymodbus 3.10 이상은 'slave' 대신 'device_id' 인자를 사용
 _UNIT_KW = ("device_id" if "device_id" in inspect.signature(ModbusSerialClient.read_holding_registers).parameters
             else "slave")
-SLAVE_ID = 1
 POLL_INTERVAL_MS = 1000  # 데이터 읽기(화면 갱신) 주기 (settings.ini 의 poll_interval_ms 로 변경)
 SAVE_INTERVAL_SEC = 30   # 저장 주기 (settings.ini 의 save_interval_sec 로 변경)
 SAVE_ONLY_ON_CHANGE = True  # 값이 바뀌었을 때만 저장 (save_only_on_change)
@@ -198,14 +197,19 @@ class ModbusWorker(QObject):
     """별도 스레드에서 Modbus 통신(연결/주기 읽기/리셋)을 담당.
     UI 스레드와는 시그널로만 주고받으므로 통신 지연이 화면을 멈추지 않는다."""
     connect_result = pyqtSignal(bool, str)   # 성공 여부, 포트
-    count_read = pyqtSignal(int)
+    count_read = pyqtSignal(object)  # Qt int(32비트)로는 큰 값이 넘쳐서 object 사용
     read_failed = pyqtSignal(str)
     reset_result = pyqtSignal(bool)
 
-    def __init__(self):
+    def __init__(self, settings):
         super().__init__()
+        self.cfg = settings
         self.client = None
         self.timer = None
+
+    def comm_text(self):
+        c = self.cfg
+        return f"{c.mb_baudrate}/{c.mb_parity}/8/{c.mb_stopbits}, 국번 {c.mb_slave_id}"
 
     @pyqtSlot(str)
     def open_port(self, port):
@@ -216,12 +220,12 @@ class ModbusWorker(QObject):
         self.timer.stop()
         self.close_client()
 
-        # CT6Y 기본 통신 설정 (9600, Even, Data 8, Stop 1)
+        # 통신 설정은 settings.ini [modbus] (CT 시리즈 기본: 9600, Even, Data 8, Stop 1)
         client = ModbusSerialClient(
             port=port,
-            baudrate=9600,
-            parity='E',
-            stopbits=1,
+            baudrate=self.cfg.mb_baudrate,
+            parity=self.cfg.mb_parity,
+            stopbits=self.cfg.mb_stopbits,
             bytesize=8,
             timeout=1
         )
@@ -244,14 +248,20 @@ class ModbusWorker(QObject):
         if not self.client:
             return
         try:
-            # Holding Register 0000번지부터 2개 읽기 (32비트 카운트 값, Slave ID=1)
-            response = self.client.read_holding_registers(address=0, count=2, **{_UNIT_KW: SLAVE_ID})
+            # 현재값(PV) 레지스터 2개 읽기 (32비트). 주소/종류/워드 순서는 settings.ini [modbus]
+            c = self.cfg
+            read = (self.client.read_input_registers if c.mb_register_type == "input"
+                    else self.client.read_holding_registers)
+            response = read(address=c.mb_pv_address, count=2, **{_UNIT_KW: c.mb_slave_id})
             if not response.isError():
-                high = response.registers[0]
-                low = response.registers[1]
-                self.count_read.emit((high << 16) | low)
+                r0, r1 = response.registers[0], response.registers[1]
+                value = (r1 << 16) | r0 if c.mb_word_order == "low_first" else (r0 << 16) | r1
+                if value >= 0x80000000:  # 32비트 부호 있는 값 (UP/DOWN 카운트 시 음수 가능)
+                    value -= 0x100000000
+                self.count_read.emit(value)
             else:
-                self.read_failed.emit("장비 응답 오류 — 통신 설정(9600/Even/8/1, ID 1)을 확인하세요.")
+                self.read_failed.emit(f"장비 응답 오류 — 통신 설정({self.comm_text()})과 "
+                                      f"레지스터 주소를 확인하세요.")
         except Exception as e:
             self.read_failed.emit(f"오류: {str(e)}")
 
@@ -261,8 +271,9 @@ class ModbusWorker(QObject):
             self.reset_result.emit(False)
             return
         try:
-            # Coil 0001번지(1)에 True 전송 -> RESET 실행
-            response = self.client.write_coil(address=1, value=True, **{_UNIT_KW: SLAVE_ID})
+            # 리셋 Coil 에 ON 전송 -> RESET 실행 (주소는 settings.ini [modbus] reset_coil_address)
+            response = self.client.write_coil(address=self.cfg.mb_reset_coil, value=True,
+                                              **{_UNIT_KW: self.cfg.mb_slave_id})
             ok = not response.isError()
         except Exception:
             ok = False
@@ -321,7 +332,7 @@ class CounterCard(QFrame):
     def init_worker(self):
         # 카드가 먼저 삭제되어도 스레드가 안전하게 끝날 수 있도록 메인 창을 부모로 둠
         self.thread = QThread(self.parent_app)
-        self.worker = ModbusWorker()
+        self.worker = ModbusWorker(self.parent_app.settings)
         self.worker.moveToThread(self.thread)
 
         self.request_open.connect(self.worker.open_port)
@@ -528,6 +539,13 @@ class CounterCard(QFrame):
         if not port:
             self.set_state("error", "COM 포트를 선택해 주세요.")
             return False
+        # 하나의 COM 포트는 한 카드만 사용할 수 있음
+        other = next((c for c in self.parent_app.cards
+                      if c is not self and c.port == port and (c.running or c.connecting)), None)
+        if other:
+            self.set_state("error", f"{port} 는 #{other.card_id} [{other.txt_name.text()}] 카드가 사용 중입니다. "
+                                    f"다른 COM 포트를 선택하세요.")
+            return False
 
         self.port = port
         # 연결 후 첫 값은 바로 저장
@@ -565,7 +583,7 @@ class CounterCard(QFrame):
         else:
             self.set_state("error", f"{port} 연결 실패 — 케이블/포트 사용 여부를 확인하세요.")
 
-    @pyqtSlot(int)
+    @pyqtSlot(object)
     def on_count_read(self, count_value):
         if not self.running:
             return  # 연결 해제 직후 도착한 이전 결과 무시
