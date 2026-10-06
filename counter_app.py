@@ -205,12 +205,11 @@ def repolish(widget):
 
 
 class ModbusWorker(QObject):
-    """별도 스레드에서 Modbus 통신(연결/주기 읽기/리셋)을 담당.
+    """별도 스레드에서 Modbus 통신(연결/주기 읽기)을 담당.
     UI 스레드와는 시그널로만 주고받으므로 통신 지연이 화면을 멈추지 않는다."""
     connect_result = pyqtSignal(bool, str)   # 성공 여부, 포트
     count_read = pyqtSignal(object)  # Qt int(32비트)로는 큰 값이 넘쳐서 object 사용
     read_failed = pyqtSignal(str)
-    reset_result = pyqtSignal(bool)
 
     def __init__(self, settings):
         super().__init__()
@@ -277,22 +276,6 @@ class ModbusWorker(QObject):
             self.read_failed.emit(f"오류: {str(e)}")
 
     @pyqtSlot()
-    def reset(self):
-        if not self.client:
-            self.reset_result.emit(False)
-            return
-        try:
-            # 리셋 Coil 에 ON 전송 -> RESET 실행 (주소는 settings.ini [modbus] reset_coil_address)
-            response = self.client.write_coil(address=self.cfg.mb_reset_coil, value=True,
-                                              **{_UNIT_KW: self.cfg.mb_slave_id})
-            ok = not response.isError()
-        except Exception:
-            ok = False
-        self.reset_result.emit(ok)
-        if ok:
-            self.poll()
-
-    @pyqtSlot()
     def close_port(self):
         if self.timer:
             self.timer.stop()
@@ -319,7 +302,6 @@ class CounterCard(QFrame):
     """개별 카운터 장비를 표시하고 제어하는 카드 위젯"""
     # 워커 스레드로 작업을 요청하는 시그널 (큐 연결로 워커 스레드에서 실행됨)
     request_open = pyqtSignal(str)
-    request_reset = pyqtSignal()
     request_close = pyqtSignal()
     request_stop = pyqtSignal()
 
@@ -358,7 +340,6 @@ class CounterCard(QFrame):
         self.worker.moveToThread(self.thread)
 
         self.request_open.connect(self.worker.open_port)
-        self.request_reset.connect(self.worker.reset)
         self.request_close.connect(self.worker.close_port)
         self.request_stop.connect(self.worker.stop)
         self.thread.finished.connect(self.worker.deleteLater)
@@ -367,7 +348,6 @@ class CounterCard(QFrame):
         self.worker.connect_result.connect(self.on_connect_result)
         self.worker.count_read.connect(self.on_count_read)
         self.worker.read_failed.connect(self.on_read_failed)
-        self.worker.reset_result.connect(self.on_reset_result)
 
         self.thread.start()
 
@@ -458,15 +438,9 @@ class CounterCard(QFrame):
         self.btn_connect.setObjectName("Connect")
         self.btn_connect.setCursor(Qt.PointingHandCursor)
         self.btn_connect.clicked.connect(self.toggle_connection)
+        # ※ 리셋 버튼은 장비의 리셋 레지스터 주소가 확인되지 않아 제거함 (카운터 본체에서 리셋)
 
-        self.btn_reset = QPushButton("↺  0 리셋")
-        self.btn_reset.setObjectName("Danger")
-        self.btn_reset.setCursor(Qt.PointingHandCursor)
-        self.btn_reset.setToolTip("카운터 값을 0으로 초기화 (연결 중에만 가능)")
-        self.btn_reset.clicked.connect(self.reset_counter)
-
-        btn_layout.addWidget(self.btn_connect, 2)
-        btn_layout.addWidget(self.btn_reset, 1)
+        btn_layout.addWidget(self.btn_connect)
 
         # 5. 상태 표시
         self.lbl_status = QLabel("대기 중")
@@ -496,7 +470,6 @@ class CounterCard(QFrame):
         running = self.running
         active = running or self.retry_timer.isActive()  # 수집 중 또는 재연결 대기 중
         locked = active or self.connecting
-        self.btn_reset.setEnabled(running)
         self.btn_connect.setEnabled(not self.connecting)
         self.port_combo.setEnabled(not locked)
         self.btn_refresh.setEnabled(not locked)
@@ -679,25 +652,6 @@ class CounterCard(QFrame):
             self.set_state("error", f"응답 없음 {READ_FAIL_LIMIT}회 — 포트를 다시 열어 재연결합니다.")
             return
         self.set_state("warning", message)
-
-    def reset_counter(self):
-        if not self.running:
-            QMessageBox.warning(self, "경고", "연결된 상태에서만 리셋이 가능합니다.")
-            return
-
-        reply = QMessageBox.question(self, '확인', f"[{self.txt_name.text()}] 카운트 수치를 0으로 초기화하시겠습니까?",
-                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply == QMessageBox.Yes and self.running:
-            self.btn_reset.setEnabled(False)
-            self.request_reset.emit()
-
-    @pyqtSlot(bool)
-    def on_reset_result(self, ok):
-        self.btn_reset.setEnabled(self.running)
-        if ok:
-            self.parent_app.show_message(f"[{self.txt_name.text()}] 0으로 리셋되었습니다.")
-        else:
-            QMessageBox.critical(self, "오류", "리셋 전송에 실패했습니다.")
 
     def confirm_delete(self):
         reply = QMessageBox.question(self, '삭제 확인', f"[{self.txt_name.text()}] 카운터를 목록에서 삭제하시겠습니까?",

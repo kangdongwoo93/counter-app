@@ -59,10 +59,6 @@ pv_address = 1003
 ;   high_first : 상위 워드가 먼저
 word_order = low_first
 
-; [0 리셋] 버튼이 ON 을 보낼 Coil 주소 (0 부터 시작, 기능코드 05)
-; ※ 장비 매뉴얼의 리셋 주소와 같은지 확인한 뒤 사용하세요.
-reset_coil_address = 1
-
 
 [devices]
 ; USB-시리얼 변환기 시리얼 번호 = 표시할 장비 이름
@@ -279,7 +275,6 @@ class Settings:
         if self.mb_word_order not in ("low_first", "high_first"):
             self.errors.append(f"[modbus] word_order 값 '{self.mb_word_order}' 이(가) 올바르지 않아 low_first 를 사용합니다.")
             self.mb_word_order = "low_first"
-        self.mb_reset_coil = self._get_int(m, "reset_coil_address", 1, minimum=0)
 
         st = cp["storage"]
         self.save_interval_sec = self._get_int(st, "save_interval_sec", 30, minimum=1)
