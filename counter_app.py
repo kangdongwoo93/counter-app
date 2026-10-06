@@ -593,7 +593,7 @@ class CounterCard(QFrame):
             self.auto_retry = True  # 한 번 연결에 성공하면 이후 끊겨도 자동 재연결
             self.serial = serial_of(port) or self.serial  # 이 카드의 변환기 기억
             self.refresh_ports(prefer=port)
-            self.set_state("connected", collecting_text(port))
+            self.set_state("connected", self.status_text())
             self.parent_app.save_config()
         else:
             self.fail_or_retry(f"{port} 연결 실패 — 케이블/포트 사용 여부를 확인하세요.")
@@ -615,7 +615,7 @@ class CounterCard(QFrame):
                 self.save_record(count_value, now)
         if self.state != "connected":
             self.set_state("connected")
-        self.lbl_status.setText(collecting_text(self.port))
+        self.lbl_status.setText(self.status_text())
 
     def should_save(self, count_value, now):
         if not SAVE_ONLY_ON_CHANGE or self.last_saved is None:
@@ -626,9 +626,23 @@ class CounterCard(QFrame):
         # 값이 그대로여도 일정 시간마다 1건 저장 (생존 신호)
         return KEEPALIVE_SEC > 0 and (now - last_ts).total_seconds() >= KEEPALIVE_SEC
 
+    def storage_name(self):
+        """CSV / DB 에 저장할 장비명: 연결된 변환기가 settings.ini [devices] 에 등록돼 있으면 그 이름,
+        없으면 카드 이름"""
+        sn = (self.serial or "").upper()
+        name = next((n for key, n in self.parent_app.settings.devices.items() if sn and key in sn), None)
+        return name or self.txt_name.text().strip()
+
+    def status_text(self):
+        text = collecting_text(self.port)
+        name = self.storage_name()
+        if name != self.txt_name.text().strip():
+            text += f" · 저장 장비명: {name}"
+        return text
+
     def save_record(self, count_value, ts):
         # 실제 저장(CSV / DB)은 저장 스레드에서 처리
-        self.parent_app.storage.put(self.txt_name.text().strip(), self.port, count_value, ts)
+        self.parent_app.storage.put(self.storage_name(), self.port, count_value, ts)
         self.last_saved = (count_value, ts)
 
     def save_last_read(self):
